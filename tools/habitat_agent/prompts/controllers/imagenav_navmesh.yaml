@@ -1,0 +1,70 @@
+name: imagenav_navmesh
+task_type: imagenav
+nav_mode: navmesh
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  If substeps is empty: create a plan to find the viewpoint matching the reference image. A typical ImageNav plan:
+    [{"action":"explore_and_compare","description":"explore scene while comparing views to reference"}, {"action":"fine_align","description":"adjust position for best match"}, {"action":"verify_match","description":"confirm view matches reference"}]
+  Set current_substep_index=0 and begin executing the first substep in THIS SAME round.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: imagenav + navmesh.**
+  You have full map tools available: find_path, navigate, topdown, sample_point.
+  The reference image path is provided in the header above. Your current view (from look() or panorama()) will be shown to you as an inline image at the start of each round. Visually compare both images to assess similarity (1-10 scale) in your perception/analysis fields.
+  If no reference image is available, use the goal_description text to guide visual matching.
+
+  You are in navmesh mode — this is fundamentally different from mapless mode:
+  - Mapless: no map, must explore blindly with forward/turn step by step.
+  - Navmesh (current): full path planner available. Use it.
+    * navigate(x, y, z): collision-free path to any reachable point, covers metres per call.
+    * sample_point(): get a random navigable coordinate to jump to unexplored areas.
+    * find_path(x, y, z): plan route and get geodesic distance before committing.
+    * topdown(): visualise your position and planned route on the overhead map.
+
+  Preferred locomotion strategy:
+  - Exploration / long-distance movement → sample_point() then navigate(). Usually far more efficient than step-by-step, because each navigate() call covers metres.
+  - Fine-grained local adjustment (orienting toward a visually detected target at close range, <2 m) → forward/turn.
+  - If navigate() comes back with collisions or visible progress stalls, consider replanning (new sample_point / find_path + re-issue navigate with a larger max_steps) before falling back to hand-steering with turn/forward.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — ImageNav navmesh controller.**
+  For substep "explore_and_compare":
+    1. Call panorama() to capture 4 directions.
+    2. For each panorama image, use VLM: "Compare this view with the target description: ${goal_desc}. How similar is it on a scale of 1-10? Which direction might lead closer to the matching viewpoint?"
+    3. Choose the most promising direction and move toward it:
+       a. Call sample_point() to get a random navigable exploration target.
+       b. Call navigate(x=X, y=Y, z=Z, max_steps=20) using the coordinate from sample_point. Use a larger max_steps (30+) in open corridors and a smaller one (5–10) only when you're already close to an obstacle or to the goal.
+       Prefer navigate here — each call covers metres. forward/turn is usually a better fit for close-range fine adjustment.
+    4. Use topdown() to plan systematic exploration if no direction seems promising.
+    5. Transition to "fine_align" when VLM reports similarity >= 7/10.
+
+  For substep "fine_align":
+    - Make small adjustments: turn(direction="left"|"right", degrees=15..30), forward(distance_m=0.25).
+    - After each adjustment, call look() and compare with VLM.
+    - Goal: maximize visual similarity to the reference.
+
+  For substep "verify_match":
+    - Use VLM: "Does this view match the target description? Rate similarity 1-10."
+    - You must have physically moved (total_steps > 0) to claim a match.
+    - If similarity >= 8/10, set status="reached" with finding.
+    - If not, return to "explore_and_compare".

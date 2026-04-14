@@ -1,0 +1,138 @@
+exclude: '^(build|data/datasets|data/scene_datasets|node_modules/|src/deps|src/obsolete)'
+
+default_language_version:
+    python: python3
+
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.1.0
+    hooks:
+    -   id: trailing-whitespace
+    -   id: check-added-large-files
+        args: ['--maxkb=2000']
+    -   id: end-of-file-fixer
+    -   id: check-case-conflict
+    -   id: check-docstring-first
+    -   id: check-executables-have-shebangs
+    -   id: check-json
+    -   id: check-merge-conflict
+    -   id: check-toml
+    -   id: check-xml
+    -   id: check-yaml
+        exclude: ^conda-build/.*/meta.yaml
+    -   id: debug-statements
+    -   id: mixed-line-ending
+        args: ['--fix=lf']
+    -   id: requirements-txt-fixer
+
+    # Changes tabs to spaces
+-   repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+    -   id: remove-tabs
+        exclude: "(^(.git|setup.cfg))|(.(json|scn|tsv)$)"
+
+-   repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
+    rev: v2.14.0
+    hooks:
+    -   id: pretty-format-ini
+        args: [--autofix]
+    -   id: pretty-format-toml
+        args: [--autofix]
+        exclude: "^pyproject\\.toml$"
+        additional_dependencies:
+         - toml-sort==0.23.1
+
+-   repo: https://github.com/pre-commit/pygrep-hooks
+    rev: v1.9.0  # Use the ref you want to point at
+    hooks:
+    -   id: python-check-blanket-noqa
+    -   id: python-check-blanket-type-ignore
+
+-   repo: https://github.com/timothycrosley/isort
+    rev: 5.12.0
+    hooks:
+    -   id: isort
+        exclude: docs/
+
+-   repo: https://github.com/ambv/black
+    rev: 23.1.0
+    hooks:
+    -   id: black
+        exclude: ^examples/tutorials/(nb_python|notebooks)
+
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.0.277
+    hooks:
+    -   id: ruff
+        args: [--fix]
+        exclude: ^examples/tutorials/(nb_python|notebooks)
+
+-   repo: https://github.com/pycqa/flake8
+    rev: 5.0.4
+    hooks:
+    -   id: flake8
+        exclude: docs/
+        additional_dependencies: &flake8_dependencies
+        - flake8-bugbear==22.1.11
+        - flake8-builtins==1.5.3
+        - flake8-comprehensions==3.10.0
+        - flake8-return==1.2.0
+        - flake8-simplify==0.17.0
+
+-   repo: https://github.com/asottile/yesqa
+    rev: v1.3.0
+    hooks:
+    -   id: yesqa
+        additional_dependencies: *flake8_dependencies
+
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 'v1.9.0'
+    hooks:
+    -   id: mypy
+        pass_filenames: false
+        additional_dependencies:
+        - attrs
+
+-   repo: https://github.com/seddonym/import-linter
+    rev: v2.1
+    hooks:
+    -   id: import-linter
+        entry: env PYTHONPATH=src_python lint-imports
+
+-   repo: https://github.com/kynan/nbstripout
+    rev: 0.5.0
+    hooks:
+    -   id: nbstripout
+
+-   repo: https://github.com/mwouts/jupytext
+    rev: v1.13.7
+    hooks:
+    -   id: jupytext
+        files: '^examples/tutorials/(notebooks|nb_python)/(.*\.py|.*\.ipynb)$'
+        args: [--update-metadata, '{"jupytext":{"notebook_metadata_filter":"all", "cell_metadata_filter":"-all"}, "accelerator":"GPU"}', --set-formats, 'nb_python//py:percent,notebooks//ipynb,', --pipe, black, --pipe, 'isort - --treat-comment-as-code "# %%"', --pipe-fmt, 'py:percent', --sync]
+        additional_dependencies:
+            - 'nbformat<=5.0.8'
+            - black==23.1.0
+            - isort==5.12.0
+
+-   repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v13.0.1
+    hooks:
+    -   id: clang-format
+        types_or: [c++, c, c#, cuda] # also run on CUDA
+        additional_dependencies:
+            - pip>=21
+
+-   repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+    -   id: cmake-format
+        exclude: (^src/(cmake/Find|deps)|configure\.h\.cmake$)
+
+
+-   repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.8.0.4
+    hooks:
+    -   id: shellcheck

@@ -1,0 +1,74 @@
+name: instruction_following_navmesh
+task_type: instruction_following
+nav_mode: navmesh
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  If substeps is empty: carefully read the goal_description (the user's instruction) and decompose it into concrete, verifiable substeps. For example, "go to the kitchen, check if there's a microwave, then go to the bedroom" becomes:
+    [{"action":"navigate_to_room","target":"kitchen"}, {"action":"inspect","target":"microwave","check":"presence"}, {"action":"navigate_to_room","target":"bedroom"}, {"action":"report","description":"summarize findings"}]
+  Set current_substep_index=0 and begin executing the first substep in THIS SAME round.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: instruction_following + navmesh.**
+  You have full map tools available: find_path, navigate, topdown, sample_point.
+  The task is open-ended — follow the instruction in goal_description. Break it into manageable steps.
+
+  You are in navmesh mode — this is fundamentally different from mapless mode:
+  - Mapless: no map, must explore blindly with forward/turn step by step.
+  - Navmesh (current): full path planner available. Use it.
+    * navigate(x, y, z): collision-free path to any reachable point, covers metres per call.
+    * sample_point(): get a random navigable coordinate to jump to unexplored areas.
+    * find_path(x, y, z): plan route and get geodesic distance before committing.
+    * topdown(): visualise your position and planned route on the overhead map.
+
+  Preferred locomotion strategy:
+  - Room-to-room navigation / long-distance movement → sample_point() then navigate(). Usually far more efficient than step-by-step, because each navigate() call covers metres.
+  - Fine-grained local adjustment (orienting toward a specific object at close range, <2 m) → forward/turn.
+  - If navigate() comes back with collisions or visible progress stalls, consider replanning (new sample_point / find_path + re-issue navigate with a larger max_steps) before falling back to hand-steering with turn/forward. Hand-steering through a long corridor with turn/forward tends to be slower than you'd expect.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — Instruction Following navmesh controller.**
+  For substep "navigate_to_room" or similar movement:
+    - Call panorama() to survey the area.
+    - Use VLM to identify rooms: "What room is this? (kitchen/bedroom/bathroom/hallway/living_room/office/other)"
+    - Look for doorways/openings leading to the target room.
+    - Move toward promising directions:
+      a. Call sample_point() to get a random navigable exploration target.
+      b. Call navigate(x=X, y=Y, z=Z, max_steps=20) using the coordinate from sample_point. Use a larger max_steps (30+) in open corridors and a smaller one (5–10) only when you're already close to an obstacle or to the goal.
+      Prefer navigate here — each call covers metres. forward/turn is usually a better fit for close-range fine adjustment.
+    - Use topdown() to visualize your exploration progress.
+    - Use spatial_memory to track which rooms you've visited.
+
+  For substep "inspect" or observation tasks:
+    - Call look() from multiple angles (turn + look).
+    - Use VLM: "Current instruction: '{substep description}'. Does this scene show completion? YES/NO/PARTIAL"
+    - Record observations via spatial_memory_append.
+
+  For substep "report":
+    - Summarize all findings from spatial_memory and action_history.
+    - Set status="reached" with finding containing the structured report.
+    - Follow any specific format requested in the instruction.
+
+  General:
+    - Mark each substep completed as you finish it (update current_substep_index).
+    - If an instruction is ambiguous, make a reasonable interpretation and proceed.
+    - If a substep seems impossible, mark it as skipped and move to the next.

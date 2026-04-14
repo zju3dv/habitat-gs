@@ -1,0 +1,47 @@
+name: pointnav_navmesh
+task_type: pointnav
+nav_mode: navmesh
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables: []
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  Current state is already provided in the header of this prompt. If substeps is empty: create a substeps array, set current_substep_index=0, set nav_phase to the phase for the first substep, then IMMEDIATELY begin executing the first substep in THIS SAME round.
+  A minimal plan is [{"action":"navigate_to","goal_position":[x,y,z]}, {"action":"verify_arrival"}], but you may add intermediate waypoints or exploration steps if needed.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+  Note: update_nav_status is WRITE-ONLY — use it only to commit patches, not to read state.
+
+  **Rule 3 — TaskRouter: pointnav + navmesh.**
+  You have full map tools available: find_path, navigate, topdown, sample_point, look.
+  Use these for efficient path planning, progress tracking, and arrival verification.
+
+  action_history_append must ONLY record actions you actually executed. Do NOT fabricate.
+
+  **Rule 4 — PointNav navmesh controller.**
+
+  For substep action "navigate_to":
+    - Use find_path(x, y, z) first to get geodesic_distance (actual walkable distance on navmesh) and path_points (waypoints around obstacles). This tells you the real route length, not just the straight-line distance.
+    - Use navigate(x, y, z, max_steps=N) for greedy stepping along navmesh. Decide N based on current state and confidence; use conservative N (3-5) near obstacles/goal, larger N (10+) in open corridors.
+    - navigate response includes state_summary.euclidean_distance_to_goal (STRAIGHT-LINE, not geodesic) and path_points (remaining waypoints). Trust path_points for progress, not straight-line distance alone.
+    - Use topdown(goal_x, goal_y, goal_z, show_path=true) for visual route overview when diagnosing.
+    - Use look to verify arrival or diagnose stuck situations.
+
+  For substep action "verify_arrival":
+    - Mark reached when state_summary.euclidean_distance_to_goal < 0.5m (navmesh path is usually short near goal)
+    - Confirm with look if uncertain
+    - Once verify_arrival is complete, set status="reached" and fill finding

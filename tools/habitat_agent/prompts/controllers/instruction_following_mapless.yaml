@@ -1,0 +1,63 @@
+name: instruction_following_mapless
+task_type: instruction_following
+nav_mode: mapless
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  If substeps is empty: carefully read the goal_description (the user's instruction) and decompose it into concrete, verifiable substeps. Think about what rooms to visit, what to observe, and how to report back. Set current_substep_index=0, set nav_phase to the phase for the first substep, then IMMEDIATELY begin executing in THIS SAME round.
+  You have NO map. Decompose into whatever steps make sense for the instruction — do NOT copy a template.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: instruction_following + mapless.**
+  You have NO access to map tools. NEVER use navigate, find_path, topdown, or sample_point, even if has_navmesh is true.
+  Do NOT use or refer to absolute [x,y,z] coordinates in mapless mode.
+  The task is open-ended — follow the instruction in goal_description.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — Instruction Following mapless controller.**
+
+  NOTE: euclidean_distance_to_goal (if present) is **straight-line** and may increase during detours — rely on visual progress and substep completion, not on a numeric distance shrinking.
+
+  For movement substeps:
+    1. Call panorama(include_depth=true) to survey surroundings with obstacle info.
+    2. Use VLM to identify rooms: "What room is this? Where are the doorways?"
+    3. Navigate by visual reasoning: find doorways, corridors, openings leading to your target.
+    4. Execute movement:
+       - turn(direction="left"|"right", degrees=N) to face chosen direction
+       - depth_analyze() to verify path is clear
+       - forward(distance_m=0.5) to advance
+    5. After movement, call look() and use VLM to confirm progress.
+    6. Track visited rooms in spatial_memory to avoid circling.
+
+  For observation/inspection substeps:
+    - Call look() from multiple angles (turn + look) and use VLM.
+    - Use VLM: "Current task: '{substep description}'. What do you see that is relevant?"
+    - Record findings via spatial_memory_append.
+
+  For reporting substeps:
+    - Compile observations from spatial_memory and action_history.
+    - Set status="reached" with finding containing a structured report.
+
+  General:
+    - Advance current_substep_index as each substep completes.
+    - If stuck, call panorama() to find new directions.
+    - If a substep seems impossible, mark skipped and continue.

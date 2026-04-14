@@ -1,0 +1,73 @@
+name: objectnav_navmesh
+task_type: objectnav
+nav_mode: navmesh
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  If substeps is empty: create a plan to find the target object. A typical ObjectNav plan:
+    [{"action":"explore_scene","description":"scan environment to locate target"}, {"action":"approach_target","description":"move toward detected object"}, {"action":"verify_found","description":"confirm target is visible and within reach"}]
+  Adapt this plan based on what you observe. Set current_substep_index=0 and begin executing the first substep in THIS SAME round.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: objectnav + navmesh.**
+  You have full map tools available: find_path, navigate, topdown, sample_point.
+  Target object: check the goal_description field for the object you need to find.
+
+  You are in navmesh mode — this is fundamentally different from mapless mode:
+  - Mapless: no map, must explore blindly with forward/turn step by step.
+  - Navmesh (current): full path planner available. Use it.
+    * navigate(x, y, z): collision-free path to any reachable point, covers metres per call.
+    * sample_point(): get a random navigable coordinate to jump to unexplored areas.
+    * find_path(x, y, z): plan route and get geodesic distance before committing.
+    * topdown(): visualise your position and planned route on the overhead map.
+
+  Preferred locomotion strategy:
+  - Exploration / long-distance movement → sample_point() then navigate(). Usually far more efficient than step-by-step, because each navigate() call covers metres.
+  - Fine-grained local adjustment (orienting toward a visually detected target at close range, <2 m) → forward/turn.
+  - If navigate() comes back with collisions or visible progress stalls, consider replanning (new sample_point / find_path + re-issue navigate with a larger max_steps) before falling back to hand-steering with turn/forward.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — ObjectNav navmesh controller.**
+  For substep "explore_scene":
+    1. Call panorama() to scan all 4 directions.
+    2. Use the VLM image tool on each panorama image: "Is there a ${goal_desc} visible? If yes, where in the frame?"
+    3. If target detected → transition to "approach_target".
+    4. If not detected → jump to an unexplored area using the path planner:
+       a. Call sample_point() to get a random navigable coordinate.
+       b. Call navigate(x=X, y=Y, z=Z, max_steps=20) to move there efficiently. Use a larger max_steps (30+) in open corridors and a smaller one (5–10) only when you're already close to an obstacle or to the goal.
+       Prefer navigate over forward/turn here — each navigate call covers metres, not 0.25 m steps.
+    5. Check spatial_memory summary to avoid revisiting explored areas.
+    6. Use topdown() to visualize exploration progress.
+
+  For substep "approach_target":
+    - You detected the target in a specific direction. Turn to face it and move forward:
+      turn(direction="left"|"right", degrees=N) then forward(distance_m=0.5).
+    - After each movement, call look() and use VLM to confirm target is getting closer.
+    - If target is lost from view, return to "explore_scene".
+    - Do NOT use navigate unless you have exact coordinates from find_path or sample_point.
+
+  For substep "verify_found":
+    - Call look() and use VLM: "Is ${goal_desc} clearly visible and within reach?"
+    - You must have physically moved toward the target (total_steps should have increased).
+    - Do NOT claim reached if you have not moved at all.
+    - If confirmed: set status="reached" with finding describing what you found.
+    - If not confirmed: return to "approach_target".

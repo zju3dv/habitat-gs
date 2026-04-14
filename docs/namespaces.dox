@@ -1,0 +1,59 @@
+// Copyright (c) Meta Platforms, Inc. and its affiliates.
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+namespace esp {
+
+/** @namespace esp
+ * @brief Root namespace
+ */
+
+/** @namespace esp::agent
+ * @brief Agent library
+ */
+
+/** @namespace esp::assets
+ * @brief Assets library
+ */
+
+/** @namespace esp::core
+ * @brief Core Habitat functionality
+ */
+
+/** @namespace esp::core::config
+ * @brief Configuration functionality
+ */
+
+/** @namespace esp::gfx
+ * @brief GFX library
+ */
+
+/** @namespace esp::gfx_batch
+ * @brief Batch renderer
+ */
+
+/** @namespace esp::logging
+ * @brief logging library
+ */
+
+/** @namespace esp::metadata
+ * @brief Metadata management
+ */
+
+/** @namespace esp::metadata::attributes
+ * @brief Metadata Attributes library
+ */
+
+/** @namespace esp::metadata::managers
+ * @brief Metadata Attribute Managers library
+ */
+
+/** @namespace esp::metadata::URDF
+ * @brief URDF parsing library
+ */
+
+/** @namespace esp::physics
+ * @brief Physics library
+ */
+
+}

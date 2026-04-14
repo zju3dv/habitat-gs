@@ -1,0 +1,132 @@
+diff --git a/llava/model/multimodal_encoder/siglip_encoder.py b/llava/model/multimodal_encoder/siglip_encoder.py
+index f1e101a..86638a9 100755
+--- a/llava/model/multimodal_encoder/siglip_encoder.py
++++ b/llava/model/multimodal_encoder/siglip_encoder.py
+@@ -565,7 +565,7 @@ class SigLipVisionTower(nn.Module):
+             rank0_print("{} is already loaded, `load_model` called again, skipping.".format(self.vision_tower_name))
+             return
+ 
+-        self.vision_tower = SigLipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
++        self.vision_tower = SigLipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map, low_cpu_mem_usage=True)
+ 
+         del self.vision_tower.vision_model.encoder.layers[-1:]
+         self.vision_tower.vision_model.head = nn.Identity()
+diff --git a/streamvln/habitat_extensions/measures.py b/streamvln/habitat_extensions/measures.py
+index 24d4165..e26ada3 100644
+--- a/streamvln/habitat_extensions/measures.py
++++ b/streamvln/habitat_extensions/measures.py
+@@ -12,7 +12,6 @@ from habitat.core.embodied_task import Action, EmbodiedTask, Measure
+ from habitat.core.logging import logger
+ from habitat.core.registry import registry
+ from habitat.core.simulator import Simulator
+-from habitat.core.utils import try_cv2_import
+ from habitat.tasks.nav.nav import DistanceToGoal, Success
+ from habitat.tasks.utils import cartesian_to_polar
+ from habitat.utils.geometry_utils import quaternion_rotate_vector
+@@ -23,7 +22,10 @@ from omegaconf import DictConfig
+ # from utils import maps
+ # from habitat_extensions.task import RxRVLNCEDatasetV1
+ 
+-cv2 = try_cv2_import()
++try:
++    import cv2
++except ImportError:
++    cv2 = None
+ 
+ 
+ def euclidean_distance(
+diff --git a/streamvln/streamvln_eval.py b/streamvln/streamvln_eval.py
+index d0e8499..18ea773 100644
+--- a/streamvln/streamvln_eval.py
++++ b/streamvln/streamvln_eval.py
+@@ -521,13 +521,27 @@ def eval():
+                                                         padding_side="right")
+     
+     config = transformers.AutoConfig.from_pretrained(args.model_path)
+-    model = StreamVLNForCausalLM.from_pretrained(
+-                args.model_path,
+-                attn_implementation="flash_attention_2",
+-                torch_dtype=torch.bfloat16,
+-                config=config,
+-                low_cpu_mem_usage=False,
+-                )
++    # Use flash_attention_2 on supported hardware (A100/H100), fall back to eager
++    try:
++        model = StreamVLNForCausalLM.from_pretrained(
++                    args.model_path,
++                    attn_implementation="flash_attention_2",
++                    torch_dtype=torch.bfloat16,
++                    config=config,
++                    low_cpu_mem_usage=False,
++                    )
++    except (ValueError, ImportError):
++        model = StreamVLNForCausalLM.from_pretrained(
++                    args.model_path,
++                    attn_implementation="eager",
++                    torch_dtype=torch.bfloat16,
++                    config=config,
++                    low_cpu_mem_usage=False,
++                    )
++    # Ensure vision tower is loaded (delay_load=True by default)
++    vision_tower = model.get_model().get_vision_tower()
++    if not getattr(vision_tower, 'is_loaded', False):
++        vision_tower.load_model()
+     model.model.num_history = args.num_history
+     model.requires_grad_(False)
+     model.to(local_rank)
+diff --git a/streamvln/streamvln_train.py b/streamvln/streamvln_train.py
+index ec5bdc6..942ead3 100644
+--- a/streamvln/streamvln_train.py
++++ b/streamvln/streamvln_train.py
+@@ -1524,6 +1524,11 @@ def get_model(model_args, training_args, data_args, bnb_model_from_pretrained_ar
+     
+     overwrite_config["mm_newline_position"] = model_args.mm_newline_position
+     overwrite_config["mm_patch_merge_type"] = model_args.mm_patch_merge_type
++
++    # Allow --vision_tower CLI to override the checkpoint's mm_vision_tower
++    # (needed when using a local copy instead of the HuggingFace repo ID)
++    if model_args.vision_tower is not None:
++        overwrite_config["mm_vision_tower"] = model_args.vision_tower
+    
+     if overwrite_config:
+         assert cfg_pretrained is not None, "cfg_pretrained is None"
+@@ -1534,12 +1539,14 @@ def get_model(model_args, training_args, data_args, bnb_model_from_pretrained_ar
+ 
+         customized_kwargs["config"] = cfg_pretrained
+ 
++    # low_cpu_mem_usage must be True when device_map is used (e.g. 4-bit quant)
++    _low_cpu = "device_map" in customized_kwargs
+     model = StreamVLNForCausalLM.from_pretrained(
+                 model_args.model_name_or_path,
+                 cache_dir=training_args.cache_dir,
+                 attn_implementation=training_args.attn_implementation,
+                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+-                low_cpu_mem_usage=False,
++                low_cpu_mem_usage=_low_cpu,
+                 **customized_kwargs,
+                 )
+     
+@@ -1568,8 +1575,6 @@ def train(attn_implementation=None):
+         bnb_model_from_pretrained_args.update(
+             dict(
+                 device_map={"": training_args.device},
+-                load_in_4bit=training_args.bits == 4,
+-                load_in_8bit=training_args.bits == 8,
+                 quantization_config=BitsAndBytesConfig(
+                     load_in_4bit=training_args.bits == 4,
+                     load_in_8bit=training_args.bits == 8,
+@@ -1650,6 +1655,14 @@ def train(attn_implementation=None):
+             padding_side="right",
+             use_fast=False,
+         )
++    else:
++        # Fallback for arbitrary checkpoint paths (e.g. merged LoRA checkpoints)
++        tokenizer = transformers.AutoTokenizer.from_pretrained(
++            model_args.model_name_or_path,
++            cache_dir=training_args.cache_dir,
++            model_max_length=training_args.model_max_length,
++            padding_side="right",
++        )
+ 
+     rank0_print(f"Prompt version: {model_args.version}")
+     if model_args.version == "v0":

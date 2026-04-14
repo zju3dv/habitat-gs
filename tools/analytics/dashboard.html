@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HabitatAgent Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: { colors: { brand: '#06b6d4' } } }
+}
+</script>
+<style>
+  [x-cloak] { display: none !important; }
+  .fade-in { animation: fadeIn .2s ease; }
+  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+  img.action-img { max-height: 220px; border-radius: 8px; cursor: pointer; transition: outline .1s; }
+  img.action-img:hover { outline: 2px solid #06b6d4; }
+  .timeline-bar { min-width: 6px; max-width: 24px; border-radius: 3px 3px 0 0; }
+  .modal-overlay { position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:50;display:flex;align-items:center;justify-content:center; }
+  .modal-overlay img { max-width:90vw;max-height:90vh;border-radius:8px; }
+</style>
+</head>
+<body class="bg-gray-950 text-gray-200 min-h-screen" x-data="dashboard()" x-init="init()">
+
+<!-- Modal for full-size image -->
+<div x-show="modalImage" x-cloak class="modal-overlay" @click="modalImage=null" @keydown.escape.window="modalImage=null">
+  <img :src="modalImage" />
+</div>
+
+<!-- Header -->
+<header class="bg-gray-900/80 backdrop-blur border-b border-gray-800 px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+  <div class="flex items-center gap-3">
+    <h1 class="text-xl font-bold text-brand">HabitatAgent</h1>
+    <span class="text-xs text-gray-500" x-text="sessions.length + ' sessions'"></span>
+  </div>
+  <div class="flex gap-2">
+    <button @click="view='list'" :class="view==='list'?'bg-brand text-black':'bg-gray-800'" class="px-3 py-1 rounded text-sm">Sessions</button>
+    <button @click="view='report'" :class="view==='report'?'bg-brand text-black':'bg-gray-800'" class="px-3 py-1 rounded text-sm">Report</button>
+  </div>
+</header>
+
+<main class="p-4 max-w-7xl mx-auto">
+
+<!-- Sessions List -->
+<div x-show="view==='list' && !selectedSession" x-cloak class="fade-in">
+  <table class="w-full text-sm">
+    <thead class="text-gray-400 border-b border-gray-800">
+      <tr>
+        <th class="text-left py-2 px-2">Loop ID</th>
+        <th class="text-left py-2 px-2">Task</th>
+        <th class="text-left py-2 px-2">Mode</th>
+        <th class="text-left py-2 px-2">Outcome</th>
+        <th class="text-right py-2 px-2">Rounds</th>
+        <th class="text-right py-2 px-2">Steps</th>
+        <th class="text-right py-2 px-2">Col</th>
+        <th class="text-right py-2 px-2" title="Geodesic when navmesh available, euclidean otherwise. Never merged.">GT end dist</th>
+        <th class="text-left py-2 px-2">Goal</th>
+        <th class="text-left py-2 px-2">Time</th>
+      </tr>
+    </thead>
+    <tbody>
+      <template x-for="s in sessions" :key="s.file">
+        <tr class="border-b border-gray-900 hover:bg-gray-900 cursor-pointer" @click="loadSession(s.file)">
+          <td class="py-2 px-2 font-mono text-xs" x-text="s.loop_id"></td>
+          <td class="py-2 px-2"><span class="px-2 py-0.5 rounded text-xs font-bold" :class="taskColor(s.task_type)" x-text="s.task_type"></span></td>
+          <td class="py-2 px-2"><span class="text-xs" :class="s.nav_mode==='mapless'?'text-red-400 font-bold':'text-green-400'" x-text="s.nav_mode"></span></td>
+          <td class="py-2 px-2"><span class="px-2 py-0.5 rounded text-xs" :class="outcomeColor(s.outcome)" x-text="s.outcome"></span></td>
+          <td class="py-2 px-2 text-right" x-text="s.rounds"></td>
+          <td class="py-2 px-2 text-right" x-text="s.total_steps"></td>
+          <td class="py-2 px-2 text-right" :class="s.collisions>0?'text-red-400':''" x-text="s.collisions"></td>
+          <td class="py-2 px-2 text-right" :title="s.has_navmesh ? 'Geodesic (navmesh)' : 'Euclidean (no navmesh)'" x-text="s.has_navmesh ? (s.gt_end_geodesic_distance!=null?s.gt_end_geodesic_distance.toFixed(2)+'m(g)':'-') : (s.gt_end_euclidean_distance!=null?s.gt_end_euclidean_distance.toFixed(2)+'m(e)':'-')"></td>
+          <td class="py-2 px-2 text-gray-400 max-w-xs truncate" x-text="s.goal_description"></td>
+          <td class="py-2 px-2 text-gray-500 text-xs" x-text="s.timestamp?.split('T')[1]?.slice(0,8)||''"></td>
+        </tr>
+      </template>
+    </tbody>
+  </table>
+</div>
+
+<!-- Session Detail -->
+<div x-show="view==='list' && selectedSession" x-cloak class="fade-in">
+  <button @click="selectedSession=null;detail=null" class="mb-4 text-sm text-brand hover:underline">&larr; Back to sessions</button>
+  <template x-if="detail">
+    <div>
+      <!-- Header -->
+      <div class="bg-gray-900 rounded-lg p-4 mb-4">
+        <div class="flex items-center gap-3 mb-2">
+          <span class="px-2 py-1 rounded text-sm font-bold" :class="taskColor(detail.nav_status.task_type)" x-text="detail.nav_status.task_type"></span>
+          <span class="text-sm" :class="detail.nav_status.nav_mode==='mapless'?'text-red-400':'text-green-400'" x-text="detail.nav_status.nav_mode"></span>
+          <span class="px-2 py-1 rounded text-sm" :class="outcomeColor(detail.nav_status.status)" x-text="detail.nav_status.status"></span>
+          <span class="text-gray-500 text-sm" x-text="'Steps: '+detail.nav_status.total_steps+' | Collisions: '+detail.nav_status.collisions"></span>
+        </div>
+        <p class="text-gray-300" x-text="'Goal: '+detail.nav_status.goal_description"></p>
+        <template x-if="detail.nav_status.finding">
+          <div class="mt-3 p-3 bg-green-900/30 border border-green-800 rounded">
+            <span class="text-green-400 font-bold text-sm">Finding: </span>
+            <span class="text-green-200 text-sm" x-text="typeof detail.nav_status.finding==='object'?JSON.stringify(detail.nav_status.finding,null,2):detail.nav_status.finding"></span>
+          </div>
+        </template>
+        <template x-if="detail.nav_status.substeps?.length">
+          <div class="mt-3">
+            <span class="text-gray-400 text-xs">Substeps:</span>
+            <div class="flex gap-2 mt-1 flex-wrap">
+              <template x-for="(sub,i) in detail.nav_status.substeps" :key="i">
+                <span class="px-2 py-0.5 rounded text-xs" :class="(typeof sub==='object'&&sub.status==='completed')?'bg-green-900 text-green-300':(typeof sub==='object'&&sub.status==='in_progress')?'bg-yellow-900 text-yellow-300':'bg-gray-800 text-gray-400'" x-text="typeof sub==='string'?('['+(i+1)+'] '+sub):(sub.action||sub.description||sub.instruction||sub.text||sub.goal||JSON.stringify(sub))+(sub.status?' ('+sub.status+')':'')"></span>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+      <!-- Videos -->
+      <template x-if="detail.videos?.length">
+        <div class="mb-4">
+          <h3 class="text-sm font-bold text-gray-400 mb-2">Videos</h3>
+          <div class="flex gap-3 flex-wrap">
+            <template x-for="v in detail.videos" :key="v.filename">
+              <div class="bg-gray-900 rounded p-2">
+                <video controls class="rounded max-h-48" :src="v.url"></video>
+                <p class="text-xs text-gray-500 mt-1" x-text="v.filename+' ('+v.size_kb+'KB)'"></p>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+      <!-- Action History -->
+      <h3 class="text-sm font-bold text-gray-400 mb-3 uppercase tracking-wider">Action History <span class="text-brand normal-case" x-text="'('+((detail.nav_status.action_history||[]).length)+' entries)'"></span></h3>
+      <div class="space-y-3 mb-4">
+        <template x-for="(entry,i) in detail.nav_status.action_history||[]" :key="i">
+          <div class="bg-gray-900 rounded-lg p-3 border border-gray-800/50">
+            <div class="flex items-center gap-2 mb-2 flex-wrap">
+              <span class="text-brand font-mono text-xs bg-brand/10 px-1.5 py-0.5 rounded" x-text="'#'+entry.step"></span>
+              <span class="font-bold text-sm text-white" x-text="entry.action||'-'"></span>
+              <span x-show="entry.collided" class="text-red-400 text-xs font-bold">COLLIDED</span>
+              <span x-show="entry.heading_deg!=null" class="text-gray-500 text-xs" x-text="entry.heading_deg!=null?'hdg '+entry.heading_deg.toFixed(0)+'°':''"></span>
+              <span x-show="entry.pos" class="text-gray-500 text-xs" x-text="entry.pos?'['+entry.pos.map(v=>v.toFixed(2)).join(', ')+']':''"></span>
+            </div>
+            <!-- Structured reasoning (perception → analysis → decision) -->
+            <template x-if="entry.perception || entry.analysis || entry.decision">
+              <div class="space-y-1 mb-2 text-sm">
+                <div x-show="entry.perception" class="flex gap-2"><span class="text-blue-400 font-bold shrink-0">Perception:</span><span class="text-gray-300" x-text="entry.perception"></span></div>
+                <div x-show="entry.analysis" class="flex gap-2"><span class="text-yellow-400 font-bold shrink-0">Analysis:</span><span class="text-gray-300" x-text="entry.analysis"></span></div>
+                <div x-show="entry.decision" class="flex gap-2"><span class="text-green-400 font-bold shrink-0">Decision:</span><span class="text-gray-300" x-text="entry.decision"></span></div>
+              </div>
+            </template>
+            <!-- Fallback: legacy saw field -->
+            <p x-show="!entry.perception && !entry.analysis && !entry.decision" class="text-gray-300 text-sm whitespace-pre-wrap mb-2" x-text="entry.saw||'-'"></p>
+            <!-- Single image: RGB + optional depth side by side -->
+            <div x-show="entry.visual_url && !entry.pano_urls?.length" class="mt-2 flex gap-2 flex-wrap">
+              <div class="relative">
+                <img :src="entry.visual_url" class="action-img" loading="lazy" @click="modalImage=entry.visual_url" />
+                <span class="absolute top-1 left-1 bg-black/70 text-white text-xs px-1.5 py-0.5 rounded">RGB</span>
+              </div>
+              <div x-show="entry.depth_url" class="relative">
+                <img :src="entry.depth_url" class="action-img" loading="lazy" @click="modalImage=entry.depth_url" />
+                <span class="absolute top-1 left-1 bg-black/70 text-yellow-300 text-xs px-1.5 py-0.5 rounded">Depth</span>
+              </div>
+            </div>
+            <!-- Panorama images (4 directions) -->
+            <div x-show="entry.pano_urls?.length" class="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2" style="max-width:800px">
+              <template x-for="pano in entry.pano_urls||[]" :key="pano.direction">
+                <div class="relative">
+                  <img :src="pano.url" class="rounded cursor-pointer w-full" style="max-height:160px;object-fit:cover" loading="lazy" @click="modalImage=pano.url" />
+                  <span class="absolute top-1 left-1 bg-black/70 text-white text-xs px-1.5 py-0.5 rounded" x-text="pano.direction"></span>
+                </div>
+              </template>
+            </div>
+            <!-- Also show single image alongside panorama if both exist -->
+            <div x-show="entry.visual_url && entry.pano_urls?.length" class="mt-2 flex gap-2">
+              <div class="relative">
+                <img :src="entry.visual_url" class="action-img" loading="lazy" @click="modalImage=entry.visual_url" />
+                <span class="absolute top-1 left-1 bg-black/70 text-white text-xs px-1.5 py-0.5 rounded">RGB</span>
+              </div>
+              <div x-show="entry.depth_url" class="relative">
+                <img :src="entry.depth_url" class="action-img" loading="lazy" @click="modalImage=entry.depth_url" />
+                <span class="absolute top-1 left-1 bg-black/70 text-yellow-300 text-xs px-1.5 py-0.5 rounded">Depth</span>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+      <!-- Spatial Memory -->
+      <template x-if="detail.spatial_memory">
+        <div class="bg-gray-900 rounded-lg p-4 mb-4">
+          <h3 class="text-sm font-bold text-gray-400 mb-3 uppercase tracking-wider">Spatial Memory</h3>
+          <div class="grid grid-cols-3 gap-4 text-sm">
+            <div class="bg-gray-800/50 rounded p-3 text-center">
+              <div class="text-2xl font-bold text-brand" x-text="detail.spatial_memory.snapshots?.length||0"></div>
+              <div class="text-gray-500 text-xs mt-1">Snapshots</div>
+            </div>
+            <div class="bg-gray-800/50 rounded p-3 text-center">
+              <div class="text-2xl font-bold text-purple-400" x-text="Object.keys(detail.spatial_memory.rooms||{}).length"></div>
+              <div class="text-gray-500 text-xs mt-1">Rooms</div>
+            </div>
+            <div class="bg-gray-800/50 rounded p-3 text-center">
+              <div class="text-2xl font-bold text-yellow-400" x-text="Object.keys(detail.spatial_memory.object_sightings||{}).length"></div>
+              <div class="text-gray-500 text-xs mt-1">Object Types</div>
+            </div>
+          </div>
+          <template x-if="Object.keys(detail.spatial_memory.object_sightings||{}).length">
+            <div class="mt-2 flex flex-wrap gap-1">
+              <template x-for="[name,data] in Object.entries(detail.spatial_memory.object_sightings||{})" :key="name">
+                <span class="px-2 py-0.5 bg-gray-800 rounded text-xs" x-text="name+' x'+data.count"></span>
+              </template>
+            </div>
+          </template>
+        </div>
+      </template>
+      <!-- Events Timeline -->
+      <template x-if="detail.events?.length">
+        <div class="bg-gray-900 rounded-lg p-4">
+          <h3 class="text-sm font-bold text-gray-400 mb-3 uppercase tracking-wider">Round Timeline</h3>
+          <div class="flex items-end gap-px overflow-x-auto pb-2" style="min-height:80px; max-height:120px;">
+            <template x-for="e in detail.events.filter(e=>e.phase==='round_end')" :key="e.round">
+              <div class="flex-shrink-0 flex flex-col items-center" style="min-width:14px;">
+                <div class="timeline-bar w-full" :class="e.status==='reached'?'bg-green-500':e.status==='blocked'?'bg-yellow-500':'bg-brand/50'" :style="'height:'+Math.max(4, Math.min(100, (e.total_steps||0)*2))+'px'" :title="'R'+e.round+': '+e.total_steps+' steps, '+(e.status||'')"></div>
+                <span class="text-gray-600 text-[9px] mt-0.5 leading-none" x-text="e.round"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+  </template>
+</div>
+
+<!-- Report View -->
+<div x-show="view==='report'" x-cloak class="fade-in">
+  <template x-if="report">
+    <div class="space-y-4">
+      <div class="bg-gray-900 rounded-lg p-4">
+        <h3 class="text-lg font-bold mb-2">Overall</h3>
+        <div class="grid grid-cols-3 gap-4">
+          <div class="text-center"><div class="text-3xl font-bold text-brand" x-text="report.total"></div><div class="text-gray-500 text-sm">Sessions</div></div>
+          <div class="text-center"><div class="text-3xl font-bold" :class="report.success_rate>50?'text-green-400':'text-red-400'" x-text="report.success_rate+'%'"></div><div class="text-gray-500 text-sm">Success Rate</div></div>
+          <div class="text-center"><div class="text-3xl font-bold text-yellow-400" x-text="report.reached||0"></div><div class="text-gray-500 text-sm">Reached</div></div>
+        </div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4">
+        <h3 class="text-sm font-bold text-gray-400 mb-2">By Task Type x Mode</h3>
+        <template x-for="g in report.groups||[]" :key="g.group">
+          <div class="flex items-center gap-3 py-1">
+            <span class="w-48 text-sm" x-text="g.group"></span>
+            <div class="flex-1 bg-gray-800 rounded-full h-4 overflow-hidden"><div class="h-full rounded-full" :class="g.success_rate>50?'bg-green-500':'bg-red-500'" :style="'width:'+g.success_rate+'%'"></div></div>
+            <span class="text-sm w-20 text-right" x-text="g.reached+'/'+g.count+' ('+g.success_rate+'%)'"></span>
+          </div>
+        </template>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4">
+        <h3 class="text-sm font-bold text-gray-400 mb-2">Tool Usage</h3>
+        <div class="space-y-1">
+          <template x-for="[tool,count] in report.tool_usage||[]" :key="tool">
+            <div class="flex items-center gap-2">
+              <span class="w-48 text-sm font-mono truncate" x-text="tool"></span>
+              <div class="flex-1 bg-gray-800 rounded-full h-3 overflow-hidden"><div class="h-full bg-brand rounded-full" :style="'width:'+Math.min(100,count/(report.tool_usage[0]?.[1]||1)*100)+'%'"></div></div>
+              <span class="text-xs text-gray-400 w-12 text-right" x-text="count"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+      <template x-if="report.capability_requests?.length">
+        <div class="bg-gray-900 rounded-lg p-4">
+          <h3 class="text-sm font-bold text-gray-400 mb-2">Agent Capability Requests</h3>
+          <template x-for="(req,i) in report.capability_requests" :key="i">
+            <div class="py-1 text-sm text-yellow-300" x-text="'• '+req"></div>
+          </template>
+        </div>
+      </template>
+    </div>
+  </template>
+</div>
+
+</main>
+
+<script>
+function dashboard() {
+  return {
+    view: 'list',
+    sessions: [],
+    selectedSession: null,
+    detail: null,
+    report: null,
+    modalImage: null,
+    async init() {
+      this.sessions = await (await fetch('/api/sessions')).json();
+      this.report = await (await fetch('/api/report')).json();
+    },
+    async loadSession(fileName) {
+      this.selectedSession = fileName;
+      this.detail = await (await fetch('/api/session/' + fileName)).json();
+    },
+    taskColor(t) {
+      const m = {pointnav:'bg-blue-900 text-blue-300',objectnav:'bg-purple-900 text-purple-300',imagenav:'bg-pink-900 text-pink-300',eqa:'bg-orange-900 text-orange-300',instruction_following:'bg-teal-900 text-teal-300'};
+      return m[t] || 'bg-gray-800 text-gray-300';
+    },
+    outcomeColor(o) {
+      const m = {reached:'bg-green-900 text-green-300',blocked:'bg-yellow-900 text-yellow-300',error:'bg-red-900 text-red-300',timeout:'bg-orange-900 text-orange-300',in_progress:'bg-blue-900 text-blue-300'};
+      return m[o] || 'bg-gray-800 text-gray-300';
+    }
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,68 @@
+name: pointnav_mapless
+task_type: pointnav
+nav_mode: mapless
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  Current state (substeps, phase, total_steps, action_history, polar signals) is already provided in the header of this prompt. If substeps is empty: analyze the situation, then create a substeps array that reflects your navigation plan. Set current_substep_index=0, set nav_phase to the phase for the first substep, then IMMEDIATELY begin executing the first substep in THIS SAME round.
+  You have NO map. Think about what you need to do: observe the environment, find passable directions, navigate toward the goal using polar signals, handle obstacles, and verify arrival. Decompose into whatever steps make sense — do NOT copy a template.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+  Note: update_nav_status is WRITE-ONLY — use it only to commit patches, not to read state.
+
+  **Rule 3 — TaskRouter: pointnav + mapless.**
+  You have NO access to map tools. NEVER use navigate, find_path, topdown, or sample_point, even if has_navmesh is true.
+  Available perception: look, depth_analyze, panorama.
+  Available movement: forward, turn.
+  Do NOT use or refer to absolute [x,y,z] coordinates in mapless mode.
+
+  action_history_append must ONLY record actions you actually executed. Do NOT fabricate.
+
+  **Rule 4 — PointNav mapless controller.**
+
+  CRITICAL UNDERSTANDING: euclidean_distance_to_goal is **straight-line (Euclidean) distance**, NOT walkable distance. The goal may be behind walls, in another room, or require going around obstacles. **Expect the straight-line distance to increase sometimes when you have to detour** — this is normal, not a failure.
+
+  For substep action "navigate_to":
+    1) Before moving, ANALYZE the situation:
+       - Use panorama (or look in multiple directions) to understand the local geometry
+       - Identify passable directions, doorways, corridors
+       - If euclidean_distance_to_goal is large (>5m), expect you'll need to navigate through multiple rooms/corridors
+       - The direct line to goal is often blocked — plan to navigate TOWARD openings that lead in the goal's general direction, not always directly at it
+
+    2) State signals from state_summary after each movement:
+       - goal_direction_deg: bearing to goal (0=ahead, positive=call turn_right, negative=call turn_left)
+       - euclidean_distance_to_goal: STRAIGHT-LINE distance (may increase during detours)
+       - COLLIDED flag: system collision truth
+
+    3) Navigation strategy:
+       a) Observe → identify a passable direction that generally advances toward the goal (even if not directly at it)
+       b) Turn to face that direction, use depth_analyze to verify clearance
+       c) Move forward in increments; re-observe periodically
+       d) When entering a new room/corridor, re-evaluate: is the goal now reachable more directly?
+
+    4) Progress judgment (do NOT use straight-line distance alone):
+       - If you are CLEARLY making visual progress (new rooms, moving through corridors) but euclidean distance temporarily increases, KEEP GOING
+       - If you are stuck in the same area for 5+ rounds with no collisions and no new observations, you're likely in a dead end — backtrack and try a different route
+       - If COLLIDED repeatedly, the direction is blocked — rotate and retry
+       - Report blocked only after exhausting multiple candidate routes (at least 2-3 distinct directions)
+
+  For substep action "verify_arrival":
+    - Mark reached when state_summary.euclidean_distance_to_goal < 0.5m
+    - Once verify_arrival is complete, set status="reached" and fill finding

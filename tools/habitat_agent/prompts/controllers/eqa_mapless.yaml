@@ -1,0 +1,68 @@
+name: eqa_mapless
+task_type: eqa
+nav_mode: mapless
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Observe, judge, explore if needed, then answer.**
+  If substeps is empty: analyze the question and create a substeps array reflecting your plan for answering it. Set current_substep_index=0, set nav_phase to the phase for the first substep, then IMMEDIATELY begin executing in THIS SAME round.
+  You have NO map. Think about what you need to see to answer the question, whether exploration is necessary, and how to search efficiently. Decompose into whatever steps make sense — do NOT copy a template.
+  The question is in the goal_description field. Read it carefully.
+  If the question is immediately answerable from the first observation, skip exploration and answer directly.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: eqa + mapless.**
+  You have NO access to map tools. NEVER use navigate, find_path, topdown, or sample_point, even if has_navmesh is true.
+  Do NOT use or refer to absolute [x,y,z] coordinates in mapless mode.
+  Your task is to ANSWER A QUESTION, not navigate to a point. Movement gathers evidence.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — EQA mapless controller.**
+
+  NOTE: euclidean_distance_to_goal (if present) is **straight-line** and may increase during detours. For EQA there often is no point goal — rely on visual evidence.
+
+  For substep "observe_and_judge":
+    - Call look() to capture the current view.
+    - Use VLM: "Question: ${goal_desc}. Can you answer from what you see? If YES, provide your answer. If NO, what evidence do you need and where might you find it?"
+    - If YES with confidence: skip to "answer" substep.
+    - If NO: proceed to exploration.
+
+  For substep "explore_for_evidence":
+    1. Call panorama(include_depth=true) to scan all directions with obstacle info.
+    2. Use VLM on each direction: "I need to answer: ${goal_desc}. Does this direction look promising for finding evidence? What do you see?"
+    3. Choose the most promising direction (doorways, relevant rooms).
+    4. Execute movement:
+       - turn(direction="left"|"right", degrees=N) to face chosen direction
+       - depth_analyze() to verify path is clear
+       - forward(distance_m=0.5) to advance
+    5. After reaching a new viewpoint, call look() and use VLM to re-evaluate.
+    6. Use spatial_memory to track visited areas — avoid circling back.
+    7. If evidence gathered, transition to "answer".
+    8. If explored thoroughly without finding evidence, answer "unknown" with search summary.
+
+  For substep "answer":
+    - Formulate the answer based on all evidence gathered.
+    - Respect the answer format:
+      * yes/no questions → yes/no/unknown with evidence
+      * Multiple choice → select best option with reasoning
+      * Open-ended → concise answer with visual evidence
+    - Set status="reached" with finding containing:
+      {"answer": "<your answer>", "evidence": "<what you saw>", "confidence": "high/medium/low"}

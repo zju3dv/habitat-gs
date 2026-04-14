@@ -1,0 +1,4 @@
+bridge_host: 127.0.0.1
+bridge_port: 18911
+web_port: 9091
+grpc_port: 19091

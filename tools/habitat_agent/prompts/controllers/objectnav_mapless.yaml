@@ -1,0 +1,62 @@
+name: objectnav_mapless
+task_type: objectnav
+nav_mode: mapless
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Decompose first, then execute.**
+  If substeps is empty: analyze the situation, then create a substeps array reflecting your search plan for the target object. Set current_substep_index=0, set nav_phase to the phase for the first substep, then IMMEDIATELY begin executing the first substep in THIS SAME round.
+  You have NO map. Think about which rooms might contain the target, how to explore efficiently, how to detect the object, and how to verify arrival. Decompose into whatever steps make sense — do NOT copy a template.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: objectnav + mapless.**
+  You have NO access to map tools. NEVER use navigate, find_path, topdown, or sample_point, even if has_navmesh is true.
+  Do NOT use or refer to absolute [x,y,z] coordinates in mapless mode.
+  Target object: check the goal_description field for the object you need to find.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — ObjectNav mapless controller.**
+
+  CRITICAL UNDERSTANDING: euclidean_distance_to_goal (if present) is **straight-line** distance and may not even be defined for object goals. Rely on visual detection, not on a numeric distance shrinking.
+
+  Exploration strategy:
+    1. Call panorama(include_depth=true) to scan all 4 directions with obstacle info.
+    2. Use the VLM image tool on each panorama image: "Is there a ${goal_desc} visible? What rooms/areas can I see? Where are doorways?"
+    3. Choose the most promising direction based on:
+       - Visibility of target object
+       - Unexplored doorways/openings (check spatial_memory for visited rooms)
+       - Clear path (depth_analyze shows passable)
+    4. Execute movement:
+       - turn(direction="left", degrees=N) or turn(direction="right", degrees=N) to face chosen direction
+       - depth_analyze() to verify path is clear
+       - forward(distance_m=0.5) to advance
+    5. After movement, call look() and run VLM to check if target is now visible.
+    6. Repeat until target found or area explored thoroughly.
+
+  Target detection:
+    - Use VLM: "Is there a ${goal_desc} visible in this image? Answer YES or NO. If YES, where in the frame?"
+    - If YES: turn toward it, move forward carefully, verify when close.
+    - Once close enough to clearly identify: set status="reached" with finding.
+    - You must have physically moved to claim reached (check total_steps > 0).
+
+  Avoid revisiting:
+    - Check spatial_memory summary — if rooms/objects listed cover areas you've been to, try a different direction.
+    - Prioritize doorways and openings you haven't explored yet.

@@ -1,0 +1,48 @@
+[submodule "src/deps/rapidjson"]
+	path = src/deps/rapidjson
+	url = https://github.com/Tencent/rapidjson.git
+[submodule "src/deps/magnum"]
+	path = src/deps/magnum
+	url = https://github.com/mosra/magnum.git
+[submodule "src/deps/corrade"]
+	path = src/deps/corrade
+	url = https://github.com/mosra/corrade.git
+[submodule "src/deps/magnum-plugins"]
+	path = src/deps/magnum-plugins
+	url = https://github.com/mosra/magnum-plugins.git
+[submodule "src/deps/pybind11"]
+	path = src/deps/pybind11
+	url = https://github.com/pybind/pybind11.git
+[submodule "src/deps/assimp"]
+	path = src/deps/assimp
+	url = https://github.com/assimp/assimp
+[submodule "src/deps/glfw"]
+	path = src/deps/glfw
+	url = https://github.com/glfw/glfw
+[submodule "src/deps/recastnavigation"]
+	path = src/deps/recastnavigation
+	url = https://github.com/recastnavigation/recastnavigation.git
+[submodule "src/deps/magnum-integration"]
+	path = src/deps/magnum-integration
+	url = https://github.com/mosra/magnum-integration.git
+[submodule "src/deps/magnum-bindings"]
+	path = src/deps/magnum-bindings
+	url = https://github.com/mosra/magnum-bindings.git
+[submodule "docs/m.css"]
+	path = docs/m.css
+	url = https://github.com/mosra/m.css
+[submodule "src/deps/tinyobjloader"]
+	path = src/deps/tinyobjloader
+	url = https://github.com/syoyo/tinyobjloader.git
+[submodule "src/deps/bullet3"]
+	path = src/deps/bullet3
+	url = https://github.com/bulletphysics/bullet3
+[submodule "src/deps/openexr"]
+	path = src/deps/openexr
+	url = https://github.com/AcademySoftwareFoundation/openexr
+[submodule "src/deps/rlr-audio-propagation"]
+	path = src/deps/rlr-audio-propagation
+	url = https://github.com/facebookresearch/rlr-audio-propagation
+[submodule "src/deps/zstd"]
+	path = src/deps/zstd
+	url = https://github.com/facebook/zstd

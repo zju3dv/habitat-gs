@@ -1,0 +1,198 @@
+# ---- Build System ----
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.10",
+]
+build-backend = "scikit_build_core.build"
+
+# ---- Project Metadata (PEP 621) ----
+[project]
+name = "habitat-gs"
+version = "0.3.3"
+description = "A high performance simulator for training embodied agents"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Meta AI Research"},
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "attrs>=19.1.0",
+    "gitpython",
+    "imageio",
+    "imageio-ffmpeg",
+    "matplotlib",
+    "numba>=0.60.0",
+    "numpy>=2.0.0,<2.4",
+    "numpy-quaternion>=2024.0.0",
+    "pillow==10.4.0",
+    "scipy>=1.13.0",
+    "tqdm",
+    "smplx",
+    "chumpy"
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis",
+    "pytest",
+    "pytest-benchmark",
+    "pytest-cov",
+    "mypy",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://aihabitat.org/"
+Documentation = "https://aihabitat.org/docs/habitat-sim/"
+Repository = "https://github.com/facebookresearch/habitat-sim"
+
+# ---- scikit-build-core Configuration ----
+[tool.scikit-build]
+cmake.source-dir = "src"
+cmake.build-type = "RelWithDebInfo"
+build.verbose = true
+cmake.version = ">=3.15"
+build-dir = "build/{wheel_tag}"
+# Install target (scikit-build-core runs `cmake --install`)
+install.strip = false
+
+# Editable installs: use "redirect" mode (default). scikit-build-core installs
+# a meta-path finder that resolves compiled extensions from the build directory
+# while pure-Python code is served from the source tree.
+editable.mode = "redirect"
+editable.rebuild = true
+editable.verbose = false
+
+# Python package sources — scikit-build-core copies these into the wheel
+# alongside the CMake-installed files
+wheel.packages = ["src_python/habitat_sim"]
+
+# CMake build options — controllable via environment variables or
+# --config-settings=cmake.define.OPTION=VALUE
+[tool.scikit-build.cmake.define]
+BUILD_PYTHON_BINDINGS = "ON"
+BUILD_GUI_VIEWERS = {env = "HABITAT_BUILD_GUI_VIEWERS", default = "ON"}
+BUILD_WITH_BULLET = {env = "HABITAT_WITH_BULLET", default = "ON"}
+BUILD_WITH_CUDA = {env = "HABITAT_WITH_CUDA", default = "OFF"}
+BUILD_WITH_AUDIO = {env = "HABITAT_WITH_AUDIO", default = "OFF"}
+BUILD_TEST = {env = "HABITAT_BUILD_TEST", default = "OFF"}
+BUILD_BASIS_COMPRESSOR = {env = "HABITAT_BUILD_BASIS_COMPRESSOR", default = "OFF"}
+BUILD_ASSIMP_SUPPORT = {env = "HABITAT_BUILD_ASSIMP", default = "ON"}
+USE_SYSTEM_ASSIMP = {env = "HABITAT_USE_SYSTEM_ASSIMP", default = "OFF"}
+USE_SYSTEM_BULLET = {env = "HABITAT_USE_SYSTEM_BULLET", default = "OFF"}
+USE_SYSTEM_MAGNUM = {env = "HABITAT_USE_SYSTEM_MAGNUM", default = "OFF"}
+USE_SYSTEM_PYBIND11 = {env = "HABITAT_USE_SYSTEM_PYBIND11", default = "OFF"}
+
+# ---- Pytest Configuration ----
+[tool.pytest.ini_options]
+addopts = "--verbose -rsxX -q"
+testpaths = ["tests"]
+markers = [
+    "gfxtest: marks a test as needing to render",
+]
+norecursedirs = ["tests/helpers"]
+
+# ---- Coverage.py Configuration ----
+[tool.coverage.run]
+# Only measure coverage for the library source code, not examples or tests
+source = [
+    "src_python/habitat_sim",
+]
+omit = [
+    "examples/*",
+    "tests/*",
+]
+
+[tool.coverage.report]
+omit = [
+    "examples/*",
+    "tests/*",
+]
+
+# ---- Code Formatting & Linting ----
+[tool.black]
+exclude = '''
+(
+  /(
+      \.eggs         # exclude a few common directories in the
+    | \.git          # root of the project
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | _build
+    | buck-out
+    | ^examples/tutorials/notebooks
+    | ^examples/tutorials/nb_python
+    | build
+    | dist
+    | obselete
+    | deps
+  )/
+)
+'''
+
+[tool.isort]
+skip_glob = ["*/deps/*", "*/build/*", "*/obselete/*"]
+known_first_party = ["habitat_sim"]
+profile = 'black'
+treat_comments_as_code = "# %%"
+
+[tool.ruff]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "data",
+    "dist",
+    "docs",
+    "src/deps",
+    "tools/run-clang-tidy.py",
+]
+ignore = [
+    "A003",
+    "B018",
+    "B9",
+    "C401",
+    "C402",
+    "C408",
+    "RET504",
+    "RET505",
+    "SIM105",
+    "PERF2",
+    "PERF4",
+]
+line-length = 88
+select = [
+    "A",
+    "B",
+    "C4",
+    "F",
+    "RET",
+    "SIM",
+    "W",
+    "PERF",
+]
+
+[tool.ruff.per-file-ignores]
+"*/__init__.py" = ["F401"]
+"examples/tutorials/nb_python/*.py" = [
+    "B008",
+    "F841",
+]

@@ -1,0 +1,24 @@
+# HabitatAgent optional dependencies
+# Required for: TUI chat interface, MCP server, LLM agent, rerun visualization
+#
+# Install with:
+#   pip install -r requirements-agent.txt
+
+# Terminal UI (TUI chat + monitoring dashboard)
+textual>=1.0.0
+rich>=13.0.0
+
+# YAML config parsing (controller prompts, config files)
+pyyaml>=6.0
+
+# MCP server (Model Context Protocol integration)
+mcp>=1.0.0
+
+# LLM client (OpenAI-compatible API)
+openai>=1.0.0
+
+# Environment variable loading (.env files)
+python-dotenv>=1.0.0
+
+# Rerun live visualization (optional, for rerun_nav_viewer.py)
+rerun-sdk

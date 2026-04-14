@@ -1,0 +1,79 @@
+name: eqa_navmesh
+task_type: eqa
+nav_mode: navmesh
+version: 1
+author: human
+
+fragments:
+  - tool_call_model
+  - __controller__
+  - observe_cycle
+  - structured_reasoning
+  - spatial_memory
+  - state_updates
+  - collision_recovery
+  - terminal_handling
+
+memory_budgets:
+  spatial: 500
+
+variables:
+  - goal_desc
+
+controller_body: |
+  **Rule 2 — Observe, judge, explore if needed, then answer.**
+  If substeps is empty: create a plan for answering the question. A typical EQA plan:
+    [{"action":"observe_and_judge","description":"look around and determine if the question can be answered from current view"}, {"action":"explore_for_evidence","description":"if more evidence is needed, navigate to relevant areas"}, {"action":"answer","description":"formulate and submit the final answer"}]
+  The question is in the goal_description field. Read it carefully and decide what evidence you need.
+  If the question is immediately answerable from the first observation, skip exploration and go straight to answer.
+  Set current_substep_index=0 and begin executing the first substep in THIS SAME round.
+  If substeps already exist and nav_phase is NOT "decomposing": skip decomposition, execute the current substep.
+
+  **Rule 3 — TaskRouter: eqa + navmesh.**
+  You have full map tools available: find_path, navigate, topdown, sample_point.
+  Your task is to ANSWER A QUESTION about the environment, not just navigate. Movement is a means to gather evidence, not the goal itself.
+
+  For EQA, gathering evidence is the goal — movement serves that purpose. In navmesh mode, use navigate for efficient exploration; reserve forward/turn for precise local adjustments.
+
+  You are in navmesh mode — this is fundamentally different from mapless mode:
+  - Mapless: no map, must explore blindly with forward/turn step by step.
+  - Navmesh (current): full path planner available. Use it.
+    * navigate(x, y, z): collision-free path to any reachable point, covers metres per call.
+    * sample_point(): get a random navigable coordinate to jump to unexplored areas.
+    * find_path(x, y, z): plan route and get geodesic distance before committing.
+    * topdown(): visualise your position and planned route on the overhead map.
+
+  Preferred locomotion strategy:
+  - Exploration / long-distance movement → sample_point() then navigate(). Usually far more efficient than step-by-step, because each navigate() call covers metres.
+  - Fine-grained local adjustment (orienting toward a visually detected target at close range, <2 m) → forward/turn.
+  - If navigate() comes back with collisions or visible progress stalls, consider replanning (new sample_point / find_path + re-issue navigate with a larger max_steps) before falling back to hand-steering with turn/forward.
+
+  action_history_append must ONLY record actions you actually executed via tool calls. Do NOT fabricate.
+
+  **Rule 4 — EQA navmesh controller.**
+  For substep "observe_and_judge":
+    - Call look() to capture the current view.
+    - Use the VLM image tool to analyze: "Question: ${goal_desc}. Can you answer this question from what you see? If YES, provide your answer. If NO, what specific evidence do you need and where might you find it?"
+    - If the VLM says YES with confidence: skip to "answer" substep.
+    - If NO: identify what rooms/areas to explore, then proceed to "explore_for_evidence".
+
+  For substep "explore_for_evidence":
+    - Call panorama() to scan all directions.
+    - Use VLM to identify relevant areas (e.g., "Where would I find a microwave? Likely in a kitchen.").
+    - Navigate toward promising areas:
+      a. Call sample_point() to get a random navigable exploration target.
+      b. Call navigate(x=X, y=Y, z=Z, max_steps=20) using the coordinate from sample_point. Use a larger max_steps (30+) in open corridors and a smaller one (5–10) only when you're already close to an obstacle or to the goal.
+      Prefer navigate here — each call covers metres. forward/turn is usually a better fit for close-range fine adjustment.
+    - Use topdown() to plan exploration routes.
+    - After each new viewpoint, re-evaluate: "With what I've seen so far, can I answer: ${goal_desc}?"
+    - Use spatial_memory to track what you've already checked — avoid revisiting.
+    - If you've explored thoroughly and still cannot answer, it's OK to say "unknown" with evidence of your search.
+
+  For substep "answer":
+    - Formulate the answer based on all evidence gathered.
+    - Respect the answer format implied by the question:
+      * "Is there...?" / "Does it have...?" → yes/no/unknown with brief evidence
+      * Multiple choice → select the best option with reasoning
+      * Open-ended → concise natural language answer with visual evidence
+    - Set status="reached" with finding containing:
+      {"answer": "<your answer>", "evidence": "<what you saw that supports your answer>", "confidence": "high/medium/low"}
