@@ -11,8 +11,11 @@
 
 <div align="center">
   <a href="https://arxiv.org/abs/2604.12626"><img src='https://img.shields.io/badge/arXiv-Habitat--GS-red' alt='Paper PDF'></a>
-  <a href='https://zju3dv.github.io/habitat-gs/'><img src='https://img.shields.io/badge/Project_Page-Habitat--GS-green' alt='Project Page'></a>
+  <a href='https://zju3dv.github.io/habitat-gs/'><img src='https://img.shields.io/badge/Project_Page-Habitat--GS-orange' alt='Project Page'></a>
   <a href="https://huggingface.co/datasets/RukawaY/gs_scenes"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-GS_Dataset-blue' alt='Hugging Face'></a>
+  <a href="docs/gs_assets/wechat.png">
+    <img src="https://img.shields.io/badge/WeChat-Group-green?logo=wechat&logoColor=green">
+  </a>
 </div>
   
 <p align="center">
