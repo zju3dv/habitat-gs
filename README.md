@@ -10,7 +10,7 @@
 </h1>
 
 <div align="center">
-  <a href=""><img src='https://img.shields.io/badge/arXiv-Habitat--GS-red' alt='Paper PDF'></a>
+  <a href="https://arxiv.org/abs/2604.12626"><img src='https://img.shields.io/badge/arXiv-Habitat--GS-red' alt='Paper PDF'></a>
   <a href='https://zju3dv.github.io/habitat-gs/'><img src='https://img.shields.io/badge/Project_Page-Habitat--GS-green' alt='Project Page'></a>
   <a href="https://huggingface.co/datasets/RukawaY/gs_scenes"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-GS_Dataset-blue' alt='Hugging Face'></a>
 </div>
@@ -873,4 +873,16 @@ The evaluator reports: Success Rate (SR), SPL, Oracle Success (OSR), and Distanc
 
 ## 📚 Citation
 
-Coming soon.
+If you find Habitat-GS useful in your research, please consider citing:
+
+```bibtex
+@misc{xia2026habitatgs,
+    title={Habitat-GS: A High-Fidelity Navigation Simulator with Dynamic Gaussian Splatting}, 
+    author={Ziyuan Xia and Jingyi Xu and Chong Cui and Yuanhong Yu and Jiazhao Zhang and Qingsong Yan and Tao Ni and Junbo Chen and Xiaowei Zhou and Hujun Bao and Ruizhen Hu and Sida Peng},
+    year={2026},
+    eprint={2604.12626},
+    archivePrefix={arXiv},
+    primaryClass={cs.RO},
+    url={https://arxiv.org/abs/2604.12626}, 
+}
+```
