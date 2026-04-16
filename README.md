@@ -73,6 +73,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ```bash
 git clone https://github.com/zju3dv/habitat-gs.git
 cd habitat-gs
+git submodule update --init --recursive
 
 # Recommended: CUDA on, Bullet off
 HABITAT_WITH_CUDA=ON HABITAT_WITH_BULLET=OFF pip install -e .
