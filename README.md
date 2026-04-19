@@ -35,10 +35,7 @@
 
 </div>
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/08a775d7-0e6c-49b7-a740-9d131e6122b2" controls width="600"></video>
-</div>
-
+https://github.com/user-attachments/assets/08a775d7-0e6c-49b7-a740-9d131e6122b2
 
 ## 📢 News
 
