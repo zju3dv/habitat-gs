@@ -87,6 +87,68 @@ except Exception as exc:
 from habitat_sim.nav import PathFinder, ShortestPath
 
 
+def _rotation_matrix_to_angle_axis_compat(rotation_matrix: torch.Tensor) -> torch.Tensor:
+    """Torchgeometry 0.1.x uses bool subtraction that fails on modern PyTorch."""
+    if not torch.is_tensor(rotation_matrix):
+        raise TypeError(f"Input type is not a torch.Tensor. Got {type(rotation_matrix)}")
+    if rotation_matrix.shape[-2:] == (3, 4):
+        rot = rotation_matrix[..., :3, :3]
+    elif rotation_matrix.shape[-2:] == (3, 3):
+        rot = rotation_matrix
+    else:
+        raise ValueError(f"Expected rotation matrices with shape (..., 3, 3/4), got {tuple(rotation_matrix.shape)}")
+
+    orig_shape = rot.shape[:-2]
+    rot = rot.reshape(-1, 3, 3)
+    trace = rot[:, 0, 0] + rot[:, 1, 1] + rot[:, 2, 2]
+    cos_angle = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    angle = torch.acos(cos_angle)
+    vee = torch.stack(
+        [
+            rot[:, 2, 1] - rot[:, 1, 2],
+            rot[:, 0, 2] - rot[:, 2, 0],
+            rot[:, 1, 0] - rot[:, 0, 1],
+        ],
+        dim=-1,
+    )
+
+    eps = torch.finfo(rot.dtype).eps * 16.0
+    sin_angle = torch.sin(angle)
+    scale = angle / (2.0 * sin_angle).clamp(min=eps)
+    angle_axis = vee * scale[:, None]
+
+    small = angle.abs() < 1.0e-6
+    if torch.any(small):
+        angle_axis = torch.where(small[:, None], 0.5 * vee, angle_axis)
+
+    near_pi = (math.pi - angle).abs() < 1.0e-4
+    if torch.any(near_pi):
+        rot_pi = rot[near_pi]
+        angle_pi = angle[near_pi]
+        diag = torch.diagonal(rot_pi, dim1=-2, dim2=-1)
+        axis = torch.sqrt(torch.clamp((diag + 1.0) * 0.5, min=0.0))
+        axis = axis.clone()
+        axis[:, 0] = torch.copysign(axis[:, 0], rot_pi[:, 2, 1] - rot_pi[:, 1, 2])
+        axis[:, 1] = torch.copysign(axis[:, 1], rot_pi[:, 0, 2] - rot_pi[:, 2, 0])
+        axis[:, 2] = torch.copysign(axis[:, 2], rot_pi[:, 1, 0] - rot_pi[:, 0, 1])
+        axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=eps)
+        angle_axis = angle_axis.clone()
+        angle_axis[near_pi] = axis * angle_pi[:, None]
+
+    return angle_axis.reshape(*orig_shape, 3)
+
+
+def _patch_torchgeometry_rotation_conversions() -> None:
+    try:
+        import torchgeometry as tgm
+        import torchgeometry.core.conversions as conversions
+    except Exception:
+        return
+
+    tgm.rotation_matrix_to_angle_axis = _rotation_matrix_to_angle_axis_compat
+    conversions.rotation_matrix_to_angle_axis = _rotation_matrix_to_angle_axis_compat
+
+
 def _parse_vec3(value: Sequence[float]) -> np.ndarray:
     return np.array(value, dtype=np.float32)
 
@@ -1764,6 +1826,8 @@ class GammaRunner:
         if gamma_root not in sys.path:
             sys.path.append(gamma_root)
 
+        _patch_torchgeometry_rotation_conversions()
+
         from exp_GAMMAPrimitive.utils import config_env as gamma_env
         from exp_GAMMAPrimitive.utils.config_creator import ConfigCreator
         from human_body_prior.tools.model_loader import load_vposer
@@ -2229,8 +2293,9 @@ def _make_body_seed(
     if randomize_start_pose:
         pose_latent = torch.randn((1, 32), device=vposer_device)
     with torch.no_grad():
-        body_pose = gamma.vposer.decode(pose_latent, output_type="aa").view(1, -1)
-    body_pose = body_pose.detach().cpu().numpy().astype(np.float32)
+        pose_matrot = gamma.vposer.decode(pose_latent, output_type="matrot")
+    pose_matrot = pose_matrot.detach().cpu().numpy().reshape(-1, 3, 3)
+    body_pose = SciRotation.from_matrix(pose_matrot).as_rotvec().reshape(1, -1).astype(np.float32)
 
     if snap_to_ground:
         bm = gamma.smplxparser_1f_root.bm_male if gender == "male" else gamma.smplxparser_1f_root.bm_female

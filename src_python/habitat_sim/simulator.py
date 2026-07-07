@@ -83,6 +83,8 @@ class Simulator(SimulatorBackend):
     _gaussian_avatar_manager: Optional[Any] = attr.ib(default=None, init=False)
     _gaussian_avatar_update_failed: bool = attr.ib(default=False, init=False)
     _gaussian_avatar_automanaged: bool = attr.ib(default=False, init=False)
+    _mesh_human_overlay: Optional[Any] = attr.ib(default=None, init=False)
+    _mesh_human_overlay_failed: bool = attr.ib(default=False, init=False)
 
     @staticmethod
     def _sanitize_config(config: Configuration) -> None:
@@ -262,6 +264,7 @@ class Simulator(SimulatorBackend):
             self.initialize_agent(agent_id)
 
         self._init_gaussian_avatars()
+        self._init_mesh_humans()
 
     def _init_gaussian_avatars(self) -> None:
         """Auto-load GaussianAvatar instances if present in the scene config."""
@@ -302,6 +305,38 @@ class Simulator(SimulatorBackend):
             logger.warning("GaussianAvatar update failed: %s", exc)
             self._gaussian_avatar_update_failed = True
             return
+
+    def _init_mesh_humans(self) -> None:
+        """Auto-load optional mesh human RGBD overlay from scene config.
+
+        Integrated after GS RGB/depth rendering and before returning sensor
+        observations. If mesh_humans.enabled is absent or false, this is a no-op.
+        """
+        self._mesh_human_overlay = None
+        self._mesh_human_overlay_failed = False
+
+        try:
+            from habitat_sim.mesh_human_overlay import load_mesh_human_overlay
+
+            self._mesh_human_overlay = load_mesh_human_overlay(self)
+        except Exception as exc:
+            logger.warning("Mesh human overlay init failed: %s", exc)
+            self._mesh_human_overlay_failed = True
+            raise
+
+    def _apply_mesh_human_overlay(
+        self,
+        observations: ObservationDict,
+        sensors: List[Sensor],
+    ) -> None:
+        if self._mesh_human_overlay is None or self._mesh_human_overlay_failed:
+            return
+        try:
+            self._mesh_human_overlay.apply(self, observations, sensors)
+        except Exception as exc:
+            logger.warning("Mesh human overlay failed: %s", exc)
+            self._mesh_human_overlay_failed = True
+            raise
 
     def step_world(self, dt: float) -> float:
         world_time = super().step_world(dt)
@@ -416,6 +451,7 @@ class Simulator(SimulatorBackend):
         observations: Dict[str, Union[ndarray, "Tensor"]] = {}
         for sensor in sensors:
             observations[sensor.uuid] = sensor.get_observation()
+        self._apply_mesh_human_overlay(observations, sensors)
 
         return observations
 
@@ -746,6 +782,7 @@ class Simulator(SimulatorBackend):
             agent_observations: ObservationDict = {}
             for sensor in agent_sensors:
                 agent_observations[sensor.uuid] = sensor.get_observation()
+            self._apply_mesh_human_overlay(agent_observations, agent_sensors)
             observations[agent_id] = agent_observations
 
         if return_single:
