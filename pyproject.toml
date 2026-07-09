@@ -44,7 +44,7 @@ dependencies = [
     "scipy>=1.13.0",
     "tqdm",
     "smplx",
-    "chumpy"
+    "chumpy-fix"
 ]
 
 [project.optional-dependencies]

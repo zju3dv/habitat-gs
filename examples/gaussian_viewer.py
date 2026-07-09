@@ -11,27 +11,45 @@ Usage:
 import argparse
 import ctypes
 from enum import Enum
+import json
 import math
 import os
+import pickle
 import string
 import sys
 import time
 from typing import Any, Dict, Optional
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+WALKER_ROOT = os.path.join(REPO_ROOT, "walker")
+if WALKER_ROOT not in sys.path:
+    sys.path.insert(0, WALKER_ROOT)
+
 flags = sys.getdlopenflags()
 sys.setdlopenflags(flags | ctypes.RTLD_GLOBAL)
 
 import magnum as mn
+import imageio.v2 as imageio
 import numpy as np
 from magnum import shaders, text
 from magnum.platform.glfw import Application
-from matplotlib import cm
+from matplotlib import cm, colormaps
 
 import habitat_sim
 from habitat_sim import physics
 from habitat_sim.logging import LoggingContext, logger
 from habitat_sim.utils.common import quat_from_angle_axis
 from habitat_sim.utils.settings import default_sim_settings, make_cfg
+
+from scripts_rpf.rpf_expert import (
+    AgentState,
+    ExpertConfig,
+    ForecastAwareFormationExpert,
+    Pose2D,
+)
+from scripts_rpf.rpf_expert.controller import integrate_unicycle
 
 
 class RenderMode(Enum):
@@ -66,6 +84,16 @@ class GaussianViewer(Application):
         start_time: Optional[float] = None,
         time_rate: float = 1.0,
         autoplay: Optional[bool] = None,
+        capture: bool = False,
+        capture_out: Optional[str] = None,
+        capture_route: Optional[str] = None,
+        capture_fps: float = 10.0,
+        capture_speed: float = 0.6,
+        capture_max_frames: Optional[int] = None,
+        capture_depth: bool = False,
+        rpf_expert: bool = False,
+        rpf_target: str = "avatar1_actor",
+        rpf_preferred_side: int = 1,
     ) -> None:
         self.gaussian_file = gaussian_file
         self.dataset = dataset
@@ -93,6 +121,46 @@ class GaussianViewer(Application):
         self.loop_time: bool = True
         self.user_time_override = start_time is not None
         self.user_autoplay_override = autoplay is not None
+        self.object_trajectories = []
+        self._object_trajectory_cache = {}
+        self.robot_control_object: str = "scout"
+        self.robot_drive_speed: float = 1.0
+        self.robot_turn_speed: float = 1.6
+        self.robot_yaw: float = 0.0
+        self.robot_ground_offset: float = 0.0
+        self.robot_control_initialized: bool = False
+        self.robot_camera_enabled: bool = False
+        self.robot_camera_front_offset: float = 0.3
+        self.robot_camera_height: float = 0.3
+        self.capture_enabled: bool = bool(capture)
+        self.capture_out = os.path.abspath(capture_out or "outputs/scout_capture")
+        self.capture_fps = float(capture_fps)
+        self.capture_speed = float(capture_speed)
+        self.capture_max_frames = capture_max_frames
+        self.capture_depth = bool(capture_depth)
+        self.capture_route_user_provided = capture_route is not None
+        self.capture_route_points = self._parse_capture_route(capture_route)
+        self.rpf_expert_enabled: bool = bool(rpf_expert)
+        self.rpf_target: str = str(rpf_target)
+        self.rpf_preferred_side: int = 1 if int(rpf_preferred_side) >= 0 else -1
+        self.rpf_expert = ForecastAwareFormationExpert(
+            ExpertConfig(dt=1.0 / max(self.capture_fps, 1.0e-6), preferred_side=self.rpf_preferred_side)
+        )
+        self.rpf_robot_pose: Optional[Pose2D] = None
+        self.rpf_last_cmd: dict[str, float] = {"v": 0.0, "omega": 0.0}
+        self.rpf_pending_result: Optional[dict[str, Any]] = None
+        self.rpf_current_robot_pos: Optional[np.ndarray] = None
+        self.rpf_current_robot_yaw: float = 0.0
+        self.capture_samples = []
+        self.capture_avatar_tracks = []
+        self.capture_records = []
+        self.capture_frame = 0
+        self.capture_rgb_dir = os.path.join(self.capture_out, "rgb")
+        self.capture_depth_dir = os.path.join(self.capture_out, "depth")
+        self.capture_human_id_mask_dir = os.path.join(self.capture_out, "human_id_mask")
+        self.capture_meta_file = None
+        self.capture_done = False
+        self.mesh_human_overlay = None
         self.show_avatar_proxies: bool = False
         self.debug_nav_collision: bool = False
         self._nav_filter_log_interval: float = 0.25
@@ -120,7 +188,7 @@ class GaussianViewer(Application):
         self.depth_min = 0.1
         self.depth_max = 10.0
         # Use Spectral_r (reversed) so near is red, far is blue
-        self.colormap = cm.get_cmap('Spectral')
+        self.colormap = colormaps.get_cmap('Spectral')
         
         # Clip percentiles for depth filtering
         self.depth_clip_min_percentile = depth_clip_min_percentile
@@ -130,6 +198,8 @@ class GaussianViewer(Application):
         self.depth_shader: mn.shaders.FlatGL2D = None
         self.depth_mesh: mn.gl.Mesh = None
         self.depth_texture: mn.gl.Texture2D = None
+        self.rgb_overlay_shader: mn.shaders.FlatGL2D = None
+        self.rgb_overlay_texture: mn.gl.Texture2D = None
 
         # Movement controls
         key = Application.Key
@@ -163,6 +233,19 @@ class GaussianViewer(Application):
             key.X: "move_down",       # Move down (sensor)
             key.Z: "move_up",         # Move up (sensor)
         }
+
+        self.robot_key_to_action = {}
+        self.robot_pressed = {}
+        for key_name, action in (
+            ("R", "forward"),
+            ("F", "backward"),
+            ("Q", "turn_left"),
+            ("E", "turn_right"),
+        ):
+            if hasattr(key, key_name):
+                robot_key = getattr(key, key_name)
+                self.robot_key_to_action[robot_key] = action
+                self.robot_pressed[robot_key] = False
 
         # Setup display font
         self.display_font = text.FontManager().load_and_instantiate("TrueTypeFont")
@@ -259,7 +342,7 @@ class GaussianViewer(Application):
             sim_settings["height"] = self.framebuffer_size[1]
             sim_settings["default_agent"] = 0
             sim_settings["default_agent_navmesh"] = False
-            sim_settings["enable_hbao"] = True
+            sim_settings["enable_hbao"] = False
             sim_settings["gaussian_auto_play"] = self.time_playing
             if self.user_time_override:
                 sim_settings["gaussian_time"] = self.current_time
@@ -269,11 +352,35 @@ class GaussianViewer(Application):
             # IMPORTANT: use GS-specific action space so keys map to valid actions
             cfg.agents[0].action_space = self.create_action_space()
             try:
+                cfg.sim_cfg.leave_context_with_background_renderer = False
+            except Exception:
+                pass
+            try:
                 self.sim = habitat_sim.Simulator(cfg)
+                self._ensure_main_thread_gl_context()
             except Exception as e:
-                self.init_error = f"Failed to create simulator (dataset mode): {e}"
-                logger.error(self.init_error)
-                return
+                if self.enable_physics:
+                    logger.warning(
+                        "Failed to create simulator with physics enabled: %s. "
+                        "Retrying without physics.",
+                        e,
+                    )
+                    try:
+                        cfg.sim_cfg.enable_physics = False
+                        self.enable_physics = False
+                        self.simulating = False
+                        self.sim = habitat_sim.Simulator(cfg)
+                        self._ensure_main_thread_gl_context()
+                    except Exception as retry_exc:
+                        self.init_error = (
+                            f"Failed to create simulator (dataset mode): {retry_exc}"
+                        )
+                        logger.error(self.init_error)
+                        return
+                else:
+                    self.init_error = f"Failed to create simulator (dataset mode): {e}"
+                    logger.error(self.init_error)
+                    return
         else:
             # Fallback PLY mode
             if not self.gaussian_file:
@@ -286,7 +393,8 @@ class GaussianViewer(Application):
             sim_cfg.enable_physics = self.enable_physics
             sim_cfg.create_renderer = True
             sim_cfg.gpu_device_id = 0
-            sim_cfg.enable_hbao = True
+            sim_cfg.enable_hbao = False
+            sim_cfg.leave_context_with_background_renderer = False
             sim_cfg.gaussian_auto_play = self.time_playing
             if self.user_time_override:
                 sim_cfg.gaussian_time = self.current_time
@@ -299,11 +407,30 @@ class GaussianViewer(Application):
             cfg = habitat_sim.Configuration(sim_cfg, [agent_cfg])
             try:
                 self.sim = habitat_sim.Simulator(cfg)
+                self._ensure_main_thread_gl_context()
             except Exception as e:
-                self.init_error = f"Failed to create simulator (PLY mode): {e}"
-                logger.error(self.init_error)
-                logger.error("Make sure CUDA is enabled and the PLY file is valid")
-                return
+                if self.enable_physics:
+                    logger.warning(
+                        "Failed to create simulator with physics enabled: %s. "
+                        "Retrying without physics.",
+                        e,
+                    )
+                    try:
+                        sim_cfg.enable_physics = False
+                        self.enable_physics = False
+                        self.simulating = False
+                        self.sim = habitat_sim.Simulator(cfg)
+                        self._ensure_main_thread_gl_context()
+                    except Exception as retry_exc:
+                        self.init_error = f"Failed to create simulator (PLY mode): {retry_exc}"
+                        logger.error(self.init_error)
+                        logger.error("Make sure CUDA is enabled and the PLY file is valid")
+                        return
+                else:
+                    self.init_error = f"Failed to create simulator (PLY mode): {e}"
+                    logger.error(self.init_error)
+                    logger.error("Make sure CUDA is enabled and the PLY file is valid")
+                    return
 
             # Manually add GS instance for rendering
             try:
@@ -334,6 +461,15 @@ class GaussianViewer(Application):
                 "GaussianAvatar auto-management active (%d avatar instance(s)).",
                 len(self.gaussian_avatar_manager.avatars),
             )
+        try:
+            from human_actor.habitat_overlay import load_mesh_human_overlay
+
+            self.mesh_human_overlay = load_mesh_human_overlay(self.sim)
+            if self.mesh_human_overlay is not None:
+                logger.info("MeshHuman overlay active for gaussian_viewer capture.")
+        except Exception as exc:
+            logger.warning("MeshHuman overlay init failed in gaussian_viewer: %s", exc)
+            self.mesh_human_overlay = None
 
         # Set initial agent state
         agent_state = habitat_sim.AgentState()
@@ -355,9 +491,24 @@ class GaussianViewer(Application):
 
         logger.info("Simulator initialized successfully")
         self._sync_time_from_sim()
+        self._load_object_trajectories()
+        self._load_capture_avatar_tracks()
         self._refresh_gaussian_avatars()
+        self._update_object_trajectories()
+        self._build_capture_samples()
         if self.user_time_override:
             self.set_time(self.current_time)
+
+    def _ensure_main_thread_gl_context(self) -> None:
+        """Best-effort transfer of the GL context back to the main thread."""
+        if self.sim is None:
+            return
+        try:
+            renderer = getattr(self.sim, "renderer", None)
+            if renderer is not None and hasattr(renderer, "acquire_gl_context"):
+                renderer.acquire_gl_context()
+        except Exception as exc:
+            logger.warning(f"Failed to acquire GL context on the main thread: {exc}")
 
     def _install_nav_collision_debug(self) -> None:
         if self.sim is None:
@@ -430,6 +581,1013 @@ class GaussianViewer(Application):
                 self.gaussian_avatar_manager.update(self.sim)
         except Exception as exc:
             logger.warning(f"GaussianAvatar refresh failed: {exc}")
+
+    def _resolve_scene_instance_path(self) -> Optional[str]:
+        if not self.dataset or not self.scene:
+            return None
+        scene_path = os.path.expanduser(self.scene)
+        if scene_path.endswith(".scene_instance.json") and os.path.exists(scene_path):
+            return os.path.abspath(scene_path)
+        try:
+            with open(self.dataset, "r", encoding="utf-8") as f:
+                dataset_cfg = json.load(f)
+        except Exception:
+            return None
+        base_dir = os.path.dirname(os.path.abspath(self.dataset))
+        paths = (
+            dataset_cfg.get("scene_instances", {})
+            .get("paths", {})
+            .get(".json", [])
+        )
+        for rel_dir in paths:
+            candidate = os.path.join(
+                base_dir, rel_dir, f"{self.scene}.scene_instance.json"
+            )
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def _load_object_trajectories(self) -> None:
+        self.object_trajectories = []
+        scene_path = self._resolve_scene_instance_path()
+        if scene_path is None:
+            return
+        try:
+            with open(scene_path, "r", encoding="utf-8") as f:
+                scene_cfg = json.load(f)
+        except Exception as exc:
+            logger.warning(f"Failed to read scene instance for object trajectories: {exc}")
+            return
+        trajectories = scene_cfg.get("object_trajectories", [])
+        if not isinstance(trajectories, list):
+            logger.warning("object_trajectories must be a list; ignoring.")
+            return
+        for traj in trajectories:
+            if not isinstance(traj, dict):
+                continue
+            keyframes = traj.get("keyframes", [])
+            if not isinstance(keyframes, list) or len(keyframes) < 2:
+                continue
+            parsed = []
+            for key in keyframes:
+                try:
+                    parsed.append(
+                        {
+                            "time": float(key["time"]),
+                            "translation": np.asarray(
+                                key["translation"], dtype=np.float32
+                            ),
+                            "yaw": float(key.get("yaw", 0.0)),
+                        }
+                    )
+                except Exception:
+                    continue
+            parsed = sorted(parsed, key=lambda item: item["time"])
+            if len(parsed) < 2:
+                continue
+            self.object_trajectories.append(
+                {
+                    "object": str(traj.get("object", "")),
+                    "loop": bool(traj.get("loop", True)),
+                    "keyframes": parsed,
+                }
+            )
+        if self.object_trajectories:
+            logger.info(
+                "Loaded %d object trajectory/trajectories.",
+                len(self.object_trajectories),
+            )
+
+    def _resolve_from_scene_file(self, scene_file: str, rel_path: str) -> str:
+        path = os.path.expanduser(str(rel_path))
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(os.path.dirname(scene_file), path))
+
+    def _load_capture_avatar_tracks(self) -> None:
+        self.capture_avatar_tracks = []
+        if not self.capture_enabled:
+            return
+        scene_path = self._resolve_scene_instance_path()
+        if scene_path is None:
+            return
+        try:
+            with open(scene_path, "r", encoding="utf-8") as f:
+                scene_cfg = json.load(f)
+        except Exception as exc:
+            logger.warning(f"Failed to read scene instance for avatar capture: {exc}")
+            return
+        avatars = scene_cfg.get("gaussian_avatars", [])
+        if not isinstance(avatars, list):
+            return
+        for avatar_index, avatar_cfg in enumerate(avatars):
+            if not isinstance(avatar_cfg, dict):
+                continue
+            driver_path = avatar_cfg.get("driver")
+            if not driver_path:
+                continue
+            driver_abs = self._resolve_from_scene_file(scene_path, str(driver_path))
+            try:
+                with open(driver_abs, "rb") as f:
+                    driver = pickle.load(f)
+                transl = np.asarray(driver.get("transl"), dtype=np.float32)
+                if transl.ndim != 2 or transl.shape[1] != 3 or transl.shape[0] == 0:
+                    continue
+                fps = float(driver.get("fps") or driver.get("joint_mats_fps") or 40.0)
+                self.capture_avatar_tracks.append(
+                    {
+                        "name": str(avatar_cfg.get("name", f"avatar{avatar_index}")),
+                        "index": avatar_index,
+                        "driver": driver_abs,
+                        "transl": transl,
+                        "fps": fps,
+                        "offset_y": float(avatar_cfg.get("offset_y", 0.0)),
+                        "time_begin": float(avatar_cfg.get("time_begin", 0.0)),
+                        "time_end": float(
+                            avatar_cfg.get(
+                                "time_end",
+                                float(avatar_cfg.get("time_begin", 0.0))
+                                + max(transl.shape[0] - 1, 1) / max(fps, 1.0e-6),
+                            )
+                        ),
+                    }
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to load avatar driver for capture: {driver_abs}: {exc}")
+        if self.capture_avatar_tracks:
+            logger.info(
+                "Capture avatar metadata: %d track(s)", len(self.capture_avatar_tracks)
+            )
+
+    def _find_rigid_object(self, handle_substring: str):
+        if not handle_substring or self.sim is None:
+            return None
+        cached = self._object_trajectory_cache.get(handle_substring)
+        if cached is not None and getattr(cached, "is_alive", True):
+            return cached
+        try:
+            manager = self.sim.get_rigid_object_manager()
+            matches = manager.get_objects_by_handle_substring(handle_substring)
+            if matches:
+                obj = next(iter(matches.values()))
+                self._object_trajectory_cache[handle_substring] = obj
+                return obj
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _sample_object_trajectory(traj: Dict[str, Any], scene_time: float):
+        keyframes = traj["keyframes"]
+        start_t = keyframes[0]["time"]
+        end_t = keyframes[-1]["time"]
+        duration = max(end_t - start_t, 1.0e-6)
+        t = float(scene_time)
+        if traj.get("loop", True):
+            t = start_t + math.fmod(max(0.0, t - start_t), duration)
+        else:
+            t = float(np.clip(t, start_t, end_t))
+
+        hi = 1
+        while hi < len(keyframes) and keyframes[hi]["time"] < t:
+            hi += 1
+        hi = min(hi, len(keyframes) - 1)
+        lo = max(0, hi - 1)
+        k0 = keyframes[lo]
+        k1 = keyframes[hi]
+        span = max(k1["time"] - k0["time"], 1.0e-6)
+        alpha = float(np.clip((t - k0["time"]) / span, 0.0, 1.0))
+        translation = (1.0 - alpha) * k0["translation"] + alpha * k1["translation"]
+
+        yaw0 = k0["yaw"]
+        yaw1 = k1["yaw"]
+        dyaw = math.atan2(math.sin(yaw1 - yaw0), math.cos(yaw1 - yaw0))
+        yaw = yaw0 + alpha * dyaw
+        return translation, yaw
+
+    def _update_object_trajectories(self) -> None:
+        if self.sim is None or not self.object_trajectories:
+            return
+        for traj in self.object_trajectories:
+            if traj.get("object", "") == self.robot_control_object:
+                continue
+            obj = self._find_rigid_object(traj.get("object", ""))
+            if obj is None:
+                continue
+            translation, yaw = self._sample_object_trajectory(
+                traj, self.current_time
+            )
+            try:
+                obj.translation = mn.Vector3(
+                    float(translation[0]), float(translation[1]), float(translation[2])
+                )
+                obj.rotation = mn.Quaternion.rotation(
+                    mn.Rad(float(yaw)), mn.Vector3.y_axis()
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to update object trajectory for {traj.get('object')}: {exc}"
+                )
+
+    def _snap_robot_translation(self, translation: np.ndarray) -> np.ndarray:
+        """Project the robot onto the NavMesh while preserving its visual height offset."""
+        if self.sim is None:
+            return translation
+        try:
+            pathfinder = self.sim.pathfinder
+            if pathfinder is None or not pathfinder.is_loaded:
+                return translation
+            snapped = np.asarray(pathfinder.snap_point(translation), dtype=np.float32)
+            if snapped.shape[0] < 3 or not np.all(np.isfinite(snapped)):
+                return translation
+            if np.linalg.norm(snapped[[0, 2]] - translation[[0, 2]]) > 1.5:
+                return translation
+            return np.asarray(
+                [snapped[0], snapped[1] + self.robot_ground_offset, snapped[2]],
+                dtype=np.float32,
+            )
+        except Exception:
+            return translation
+
+    def _initialize_robot_keyboard_control(self, obj) -> None:
+        if self.robot_control_initialized:
+            return
+        translation = np.asarray(
+            [obj.translation[0], obj.translation[1], obj.translation[2]],
+            dtype=np.float32,
+        )
+        try:
+            pathfinder = self.sim.pathfinder if self.sim is not None else None
+            if pathfinder is not None and pathfinder.is_loaded:
+                snapped = np.asarray(pathfinder.snap_point(translation), dtype=np.float32)
+                if snapped.shape[0] >= 3 and np.all(np.isfinite(snapped)):
+                    self.robot_ground_offset = float(translation[1] - snapped[1])
+        except Exception:
+            self.robot_ground_offset = 0.0
+        self.robot_control_initialized = True
+        logger.info(
+            "Keyboard robot control enabled for '%s': R/F drive, Q/E turn.",
+            self.robot_control_object,
+        )
+
+    def _update_robot_keyboard_control(self, dt: float) -> None:
+        if self.sim is None or not self.robot_pressed:
+            return
+        if not any(self.robot_pressed.values()):
+            return
+        obj = self._find_rigid_object(self.robot_control_object)
+        if obj is None:
+            return
+
+        self._initialize_robot_keyboard_control(obj)
+        dt = float(np.clip(dt, 0.0, 0.1))
+        turn = 0.0
+        drive = 0.0
+        for key, is_pressed in self.robot_pressed.items():
+            if not is_pressed:
+                continue
+            action = self.robot_key_to_action.get(key)
+            if action == "turn_left":
+                turn += 1.0
+            elif action == "turn_right":
+                turn -= 1.0
+            elif action == "forward":
+                drive += 1.0
+            elif action == "backward":
+                drive -= 1.0
+
+        self.robot_yaw += turn * self.robot_turn_speed * dt
+        translation = np.asarray(
+            [obj.translation[0], obj.translation[1], obj.translation[2]],
+            dtype=np.float32,
+        )
+        if abs(drive) > 1.0e-6:
+            forward = np.asarray(
+                [-math.sin(self.robot_yaw), 0.0, -math.cos(self.robot_yaw)],
+                dtype=np.float32,
+            )
+            translation = translation + forward * (drive * self.robot_drive_speed * dt)
+            translation = self._snap_robot_translation(translation)
+
+        try:
+            obj.translation = mn.Vector3(
+                float(translation[0]), float(translation[1]), float(translation[2])
+            )
+            obj.rotation = mn.Quaternion.rotation(
+                mn.Rad(float(self.robot_yaw)), mn.Vector3.y_axis()
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to update keyboard robot control: {exc}")
+
+    def _update_robot_camera(self) -> None:
+        if not self.robot_camera_enabled or self.sim is None:
+            return
+        obj = self._find_rigid_object(self.robot_control_object)
+        if obj is None:
+            return
+
+        translation = np.asarray(
+            [obj.translation[0], obj.translation[1], obj.translation[2]],
+            dtype=np.float32,
+        )
+        forward = np.asarray(
+            [-math.sin(self.robot_yaw), 0.0, -math.cos(self.robot_yaw)],
+            dtype=np.float32,
+        )
+        camera_pos = (
+            translation
+            + forward * self.robot_camera_front_offset
+            + np.asarray([0.0, self.robot_camera_height, 0.0], dtype=np.float32)
+        )
+
+        state = habitat_sim.AgentState()
+        state.position = camera_pos
+        state.rotation = quat_from_angle_axis(
+            self.robot_yaw, np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+        )
+        try:
+            self.default_agent.set_state(state)
+        except Exception as exc:
+            logger.warning(f"Failed to update scout camera pose: {exc}")
+
+    @staticmethod
+    def _parse_capture_route(route: Optional[str]) -> list[np.ndarray]:
+        if not route:
+            return [
+                np.asarray([-2.0, 0.097, -3.5], dtype=np.float32),
+                np.asarray([4.0, 0.097, 4.5], dtype=np.float32),
+            ]
+        points = []
+        for token in route.split(":"):
+            token = token.strip()
+            if not token:
+                continue
+            parts = token.split(",")
+            if len(parts) != 3:
+                raise ValueError(f"Capture route point must be x,y,z, got: {token}")
+            points.append(np.asarray([float(v) for v in parts], dtype=np.float32))
+        if len(points) < 2:
+            raise ValueError("Capture route must contain at least two points.")
+        return points
+
+    def _snap_capture_route(self) -> None:
+        if self.sim is None or not self.capture_route_points:
+            return
+        try:
+            pathfinder = self.sim.pathfinder
+            if pathfinder is None or not pathfinder.is_loaded:
+                return
+            snapped = []
+            for point in self.capture_route_points:
+                candidate = np.asarray(pathfinder.snap_point(point), dtype=np.float32)
+                snapped.append(candidate if np.all(np.isfinite(candidate)) else point)
+            self.capture_route_points = snapped
+        except Exception:
+            pass
+
+    @staticmethod
+    def _habitat_yaw_to_rpf_theta(yaw: float) -> float:
+        return math.atan2(-math.cos(float(yaw)), -math.sin(float(yaw)))
+
+    @staticmethod
+    def _rpf_theta_to_habitat_yaw(theta: float) -> float:
+        return math.atan2(-math.cos(float(theta)), -math.sin(float(theta)))
+
+    @staticmethod
+    def _habitat_xz_to_pose2d(position: np.ndarray, yaw: float) -> Pose2D:
+        return Pose2D(
+            x=float(position[0]),
+            y=float(position[2]),
+            theta=GaussianViewer._habitat_yaw_to_rpf_theta(yaw),
+        )
+
+    @staticmethod
+    def _pose2d_to_habitat_position(pose: Pose2D, y: float) -> np.ndarray:
+        return np.asarray([pose.x, y, pose.y], dtype=np.float32)
+
+    def _build_capture_samples(self) -> None:
+        if not self.capture_enabled:
+            return
+        self._snap_capture_route()
+        if self.rpf_expert_enabled:
+            frame_count = int(self.capture_max_frames) if self.capture_max_frames is not None else 150
+            frame_count = max(1, frame_count)
+            self.capture_samples = [
+                (frame_idx, frame_idx / self.capture_fps, None, None)
+                for frame_idx in range(frame_count)
+            ]
+            os.makedirs(self.capture_rgb_dir, exist_ok=True)
+            if self.capture_depth:
+                os.makedirs(self.capture_depth_dir, exist_ok=True)
+            os.makedirs(self.capture_human_id_mask_dir, exist_ok=True)
+            os.makedirs(self.capture_out, exist_ok=True)
+            self.capture_meta_file = open(
+                os.path.join(self.capture_out, "poses.jsonl"), "w", encoding="utf-8"
+            )
+            self.robot_camera_enabled = True
+            self.render_mode = RenderMode.RGB
+            self.time_playing = False
+            logger.info(
+                "RPF expert capture enabled: %d frames, fps=%.2f, target=%s, out=%s",
+                len(self.capture_samples),
+                self.capture_fps,
+                self.rpf_target,
+                self.capture_out,
+            )
+            return
+        segments = []
+        total_length = 0.0
+        for start, end in zip(self.capture_route_points[:-1], self.capture_route_points[1:]):
+            delta = end - start
+            length = float(np.linalg.norm(delta[[0, 2]]))
+            if length <= 1.0e-6:
+                continue
+            segments.append((start, end, length))
+            total_length += length
+        if not segments:
+            raise ValueError("Capture route has zero horizontal length.")
+
+        frame_count = max(
+            1,
+            int(math.ceil(total_length / max(self.capture_speed, 1.0e-6) * self.capture_fps)),
+        )
+        if self.capture_max_frames is not None:
+            frame_count = min(frame_count, int(self.capture_max_frames))
+
+        self.capture_samples = []
+        for frame_idx in range(frame_count):
+            dist = min(frame_idx / self.capture_fps * self.capture_speed, total_length)
+            remaining = dist
+            start, end, length = segments[-1]
+            for seg_start, seg_end, seg_length in segments:
+                if remaining <= seg_length:
+                    start, end, length = seg_start, seg_end, seg_length
+                    break
+                remaining -= seg_length
+            alpha = float(np.clip(remaining / max(length, 1.0e-6), 0.0, 1.0))
+            pos = (1.0 - alpha) * start + alpha * end
+            tangent = end - start
+            yaw = math.atan2(-float(tangent[0]), -float(tangent[2]))
+            self.capture_samples.append((frame_idx, frame_idx / self.capture_fps, pos, yaw))
+
+        os.makedirs(self.capture_rgb_dir, exist_ok=True)
+        if self.capture_depth:
+            os.makedirs(self.capture_depth_dir, exist_ok=True)
+        os.makedirs(self.capture_human_id_mask_dir, exist_ok=True)
+        os.makedirs(self.capture_out, exist_ok=True)
+        self.capture_meta_file = open(
+            os.path.join(self.capture_out, "poses.jsonl"), "w", encoding="utf-8"
+        )
+        self.robot_camera_enabled = True
+        self.render_mode = RenderMode.RGB
+        self.time_playing = False
+        logger.info(
+            "Capture enabled: %d frames, fps=%.2f, out=%s",
+            len(self.capture_samples),
+            self.capture_fps,
+            self.capture_out,
+        )
+
+    def _sample_capture_avatar_track(self, track: dict[str, Any], scene_time: float) -> dict[str, Any]:
+        transl = track["transl"]
+        frame_count = int(transl.shape[0])
+        time_begin = float(track["time_begin"])
+        time_end = float(track["time_end"])
+        if scene_time < time_begin or scene_time > time_end:
+            active = False
+            frame_pos = 0.0 if scene_time < time_begin else float(frame_count - 1)
+        else:
+            active = True
+            step = 1.0 / max(float(track["fps"]), 1.0e-6)
+            frame_pos = (scene_time - time_begin) / step
+            frame_pos = float(np.clip(frame_pos, 0.0, frame_count - 1))
+
+        idx0 = int(math.floor(frame_pos))
+        idx1 = min(idx0 + 1, frame_count - 1)
+        alpha = float(frame_pos - idx0)
+        position = (1.0 - alpha) * transl[idx0] + alpha * transl[idx1]
+        position = np.asarray(position, dtype=np.float32).copy()
+        position[1] += float(track["offset_y"])
+
+        prev_idx = max(0, idx0 - 1)
+        next_idx = min(frame_count - 1, idx1 + 1)
+        delta = transl[next_idx] - transl[prev_idx]
+        if float(np.linalg.norm(delta[[0, 2]])) <= 1.0e-6:
+            yaw = 0.0
+        else:
+            yaw = math.atan2(-float(delta[0]), -float(delta[2]))
+
+        return {
+            "name": track["name"],
+            "index": int(track["index"]),
+            "active": bool(active),
+            "position": position,
+            "yaw": float(yaw),
+            "driver_frame": float(frame_pos),
+            "driver_frame_index": int(round(frame_pos)),
+            "driver": track["driver"],
+        }
+
+    def _avatar_sample_to_agent_state(
+        self,
+        sample: dict[str, Any],
+        sample_next: Optional[dict[str, Any]] = None,
+        dt: Optional[float] = None,
+    ) -> AgentState:
+        position = np.asarray(sample["position"], dtype=np.float32)
+        yaw = float(sample["yaw"])
+        if sample_next is not None and dt is not None and dt > 1.0e-6:
+            next_position = np.asarray(sample_next["position"], dtype=np.float32)
+            velocity = (
+                float((next_position[0] - position[0]) / dt),
+                float((next_position[2] - position[2]) / dt),
+            )
+        else:
+            theta = self._habitat_yaw_to_rpf_theta(yaw)
+            velocity = (0.0, 0.0)
+            return AgentState(
+                agent_id=int(sample["index"]) + 1,
+                pose=Pose2D(float(position[0]), float(position[2]), theta),
+                velocity=velocity,
+            )
+        return AgentState(
+            agent_id=int(sample["index"]) + 1,
+            pose=self._habitat_xz_to_pose2d(position, yaw),
+            velocity=velocity,
+        )
+
+    def _build_rpf_avatar_future(
+        self, scene_time: float
+    ) -> tuple[list[AgentState], dict[int, list[AgentState]], Optional[dict[str, Any]]]:
+        cfg = self.rpf_expert.config
+        horizon_steps = max(2, int(round(cfg.horizon_sec / cfg.dt)) + 1)
+        target_track = None
+        other_tracks = []
+        for track in self.capture_avatar_tracks:
+            if track["name"] == self.rpf_target or str(track["index"]) == self.rpf_target:
+                target_track = track
+            else:
+                other_tracks.append(track)
+        if target_track is None and self.capture_avatar_tracks:
+            target_track = self.capture_avatar_tracks[0]
+            other_tracks = self.capture_avatar_tracks[1:]
+            if self.capture_frame == 0:
+                logger.warning(
+                    "RPF target %r not found; using first avatar %s.",
+                    self.rpf_target,
+                    target_track["name"],
+                )
+        if target_track is None:
+            return [], {}, None
+
+        def build_future(track: dict[str, Any]) -> list[AgentState]:
+            future = []
+            for step_idx in range(horizon_steps):
+                t = scene_time + step_idx * cfg.dt
+                sample = self._sample_capture_avatar_track(track, t)
+                next_sample = self._sample_capture_avatar_track(track, t + cfg.dt)
+                future.append(self._avatar_sample_to_agent_state(sample, next_sample, cfg.dt))
+            return future
+
+        target_future = build_future(target_track)
+        pedestrians_future = {
+            int(track["index"]) + 1: build_future(track)
+            for track in other_tracks
+        }
+        target_now = self._sample_capture_avatar_track(target_track, scene_time)
+        return target_future, pedestrians_future, target_now
+
+    def _initialize_rpf_robot_pose(self, scene_time: float) -> None:
+        if self.rpf_robot_pose is not None:
+            return
+        if self.capture_route_user_provided and self.capture_route_points:
+            start_pos = np.asarray(self.capture_route_points[0], dtype=np.float32)
+        else:
+            obj = self._find_rigid_object(self.robot_control_object)
+            if obj is not None:
+                start_pos = np.asarray(
+                    [obj.translation[0], obj.translation[1], obj.translation[2]],
+                    dtype=np.float32,
+                )
+            else:
+                start_pos = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+        self.rpf_current_robot_pos = start_pos.copy()
+        target_future, _peds, target_now = self._build_rpf_avatar_future(scene_time)
+        if target_now is not None:
+            target_pos = np.asarray(target_now["position"], dtype=np.float32)
+            delta = target_pos - start_pos
+            yaw = math.atan2(-float(delta[0]), -float(delta[2]))
+        elif target_future:
+            target = target_future[0].pose
+            delta = np.asarray([target.x - start_pos[0], target.y - start_pos[2]], dtype=np.float32)
+            yaw = math.atan2(-float(delta[0]), -float(delta[1]))
+        else:
+            yaw = self.robot_yaw
+        self.rpf_current_robot_yaw = float(yaw)
+        self.robot_yaw = float(yaw)
+        self.rpf_robot_pose = self._habitat_xz_to_pose2d(start_pos, yaw)
+
+        try:
+            pathfinder = self.sim.pathfinder if self.sim is not None else None
+            if pathfinder is not None and pathfinder.is_loaded:
+                snapped = np.asarray(pathfinder.snap_point(start_pos), dtype=np.float32)
+                if snapped.shape[0] >= 3 and np.all(np.isfinite(snapped)):
+                    self.robot_ground_offset = float(start_pos[1] - snapped[1])
+        except Exception:
+            self.robot_ground_offset = 0.0
+
+    def _update_rpf_expert_frame(self, frame_idx: int, scene_time: float) -> None:
+        self._initialize_rpf_robot_pose(scene_time)
+        if self.rpf_robot_pose is None:
+            return
+        robot_pos = self._pose2d_to_habitat_position(
+            self.rpf_robot_pose,
+            self.rpf_current_robot_pos[1] if self.rpf_current_robot_pos is not None else 0.0,
+        )
+        robot_pos = self._snap_robot_translation(robot_pos)
+        self.rpf_current_robot_pos = robot_pos
+        self.rpf_current_robot_yaw = self._rpf_theta_to_habitat_yaw(self.rpf_robot_pose.theta)
+        self.robot_yaw = float(self.rpf_current_robot_yaw)
+
+        obj = self._find_rigid_object(self.robot_control_object)
+        if obj is not None:
+            obj.translation = mn.Vector3(
+                float(robot_pos[0]), float(robot_pos[1]), float(robot_pos[2])
+            )
+            obj.rotation = mn.Quaternion.rotation(
+                mn.Rad(float(self.rpf_current_robot_yaw)), mn.Vector3.y_axis()
+            )
+
+        try:
+            self.sim.gaussian_time = float(scene_time)
+            self._refresh_gaussian_avatars()
+        except Exception:
+            pass
+        self.current_time = float(scene_time)
+
+        target_future, pedestrians_future, _target_now = self._build_rpf_avatar_future(scene_time)
+        robot_state = AgentState(
+            agent_id=0,
+            pose=self.rpf_robot_pose,
+            velocity=(
+                float(self.rpf_last_cmd["v"] * math.cos(self.rpf_robot_pose.theta)),
+                float(self.rpf_last_cmd["v"] * math.sin(self.rpf_robot_pose.theta)),
+            ),
+        )
+        if target_future:
+            self.rpf_pending_result = self.rpf_expert.step(
+                robot_state=robot_state,
+                target_future=target_future,
+                pedestrians_future=pedestrians_future,
+            )
+        else:
+            self.rpf_pending_result = None
+        self._update_robot_camera()
+
+    def _advance_rpf_robot_after_capture(self) -> None:
+        if not self.rpf_expert_enabled or self.rpf_robot_pose is None:
+            return
+        if self.rpf_pending_result is None:
+            return
+        cmd_vel = self.rpf_pending_result.get("cmd_vel", {"v": 0.0, "omega": 0.0})
+        self.rpf_last_cmd = {"v": float(cmd_vel["v"]), "omega": float(cmd_vel["omega"])}
+        self.rpf_robot_pose = integrate_unicycle(
+            self.rpf_robot_pose,
+            self.rpf_last_cmd,
+            1.0 / max(self.capture_fps, 1.0e-6),
+        )
+
+    def _update_capture_frame(self) -> None:
+        if not self.capture_enabled or self.capture_done or self.sim is None:
+            return
+        if self.capture_frame >= len(self.capture_samples):
+            self._finish_capture()
+            return
+
+        frame_idx, scene_time, robot_pos, yaw = self.capture_samples[self.capture_frame]
+        if self.rpf_expert_enabled:
+            self._update_rpf_expert_frame(int(frame_idx), float(scene_time))
+            return
+
+        self.robot_yaw = float(yaw)
+        obj = self._find_rigid_object(self.robot_control_object)
+        if obj is not None:
+            obj.translation = mn.Vector3(
+                float(robot_pos[0]), float(robot_pos[1]), float(robot_pos[2])
+            )
+            obj.rotation = mn.Quaternion.rotation(mn.Rad(float(yaw)), mn.Vector3.y_axis())
+
+        try:
+            self.sim.gaussian_time = float(scene_time)
+            self._refresh_gaussian_avatars()
+        except Exception:
+            pass
+        self.current_time = float(scene_time)
+        self._update_robot_camera()
+
+    def _rgb_observation_to_uint8(self, obs: np.ndarray) -> np.ndarray:
+        rgb = np.asarray(obs)
+        if rgb.ndim == 3 and rgb.shape[2] == 4:
+            rgb = rgb[:, :, :3]
+        return np.ascontiguousarray(rgb.astype(np.uint8))
+
+    def _sample_capture_avatars(self, scene_time: float) -> list[dict[str, Any]]:
+        records = []
+        for track in self.capture_avatar_tracks:
+            if int(track["transl"].shape[0]) <= 0:
+                continue
+            sample = self._sample_capture_avatar_track(track, scene_time)
+            records.append(
+                {
+                    "name": sample["name"],
+                    "index": int(sample["index"]),
+                    "active": bool(sample["active"]),
+                    "position": np.asarray(sample["position"], dtype=np.float32).astype(float).tolist(),
+                    "yaw": float(sample["yaw"]),
+                    "driver_frame": float(sample["driver_frame"]),
+                    "driver_frame_index": int(sample["driver_frame_index"]),
+                    "driver": os.path.relpath(track["driver"], self.capture_out),
+                }
+            )
+        return records
+
+    def _save_capture_frame(self) -> None:
+        if not self.capture_enabled or self.capture_done or self.sim is None:
+            return
+        if self.capture_frame >= len(self.capture_samples):
+            self._finish_capture()
+            return
+
+        frame_idx, scene_time, robot_pos, yaw = self.capture_samples[self.capture_frame]
+        if self.rpf_expert_enabled:
+            if self.rpf_current_robot_pos is None:
+                logger.warning("RPF capture skipped frame %d: robot pose not initialized", frame_idx)
+                return
+            robot_pos = self.rpf_current_robot_pos.astype(np.float32)
+            yaw = float(self.rpf_current_robot_yaw)
+        # Use the Simulator observation API here so optional mesh_humans RGBD
+        # overlay runs after Habitat-GS color/depth rendering and before save.
+        obs = self.sim.get_sensor_observations()
+        if self.mesh_human_overlay is not None:
+            self.mesh_human_overlay.apply(
+                self.sim,
+                obs,
+                [self.color_sensor_wrapper, self.depth_sensor_wrapper],
+            )
+        rgb_obs = obs.get("color_sensor")
+        if rgb_obs is None:
+            logger.warning("Capture skipped frame %d: no RGB observation", frame_idx)
+            return
+        rgb = self._rgb_observation_to_uint8(rgb_obs)
+        rgb_rel = f"rgb/{frame_idx:06d}.png"
+        imageio.imwrite(os.path.join(self.capture_out, rgb_rel), rgb)
+
+        depth_rel = None
+        if self.capture_depth:
+            depth_obs = obs.get("depth_sensor")
+            if depth_obs is not None:
+                depth_rel = f"depth/{frame_idx:06d}.npy"
+                np.save(
+                    os.path.join(self.capture_out, depth_rel),
+                    np.asarray(depth_obs, dtype=np.float32),
+                )
+
+        human_id_mask_rel = None
+        human_id_mask = obs.get("human_id_mask")
+        if human_id_mask is not None:
+            human_id_mask_rel = f"human_id_mask/{frame_idx:06d}.npy"
+            np.save(
+                os.path.join(self.capture_out, human_id_mask_rel),
+                np.asarray(human_id_mask, dtype=np.int32),
+            )
+
+        forward = np.asarray([-math.sin(yaw), 0.0, -math.cos(yaw)], dtype=np.float32)
+        camera_pos = (
+            robot_pos
+            + forward * self.robot_camera_front_offset
+            + np.asarray([0.0, self.robot_camera_height, 0.0], dtype=np.float32)
+        )
+        if self.capture_meta_file is not None:
+            avatars = self._sample_capture_avatars(float(scene_time))
+            record = {
+                "frame": int(frame_idx),
+                "time": float(scene_time),
+                "rgb": rgb_rel,
+                "depth": depth_rel,
+                "human_id_mask": human_id_mask_rel,
+                "robot_position": robot_pos.astype(float).tolist(),
+                "robot_yaw": float(yaw),
+                "camera_position": camera_pos.astype(float).tolist(),
+                "camera_yaw": float(yaw),
+                "avatars": avatars,
+            }
+            if self.rpf_expert_enabled:
+                rpf_result = self.rpf_pending_result or {}
+                target = next(
+                    (
+                        avatar
+                        for avatar in avatars
+                        if avatar.get("name") == self.rpf_target
+                        or str(avatar.get("index")) == self.rpf_target
+                    ),
+                    avatars[0] if avatars else None,
+                )
+                record.update(
+                    {
+                        "episode_id": f"{self.scene or 'scene'}_rpf_expert",
+                        "scene_id": self.scene,
+                        "target_id": None if target is None else target.get("name"),
+                        "target_position": None if target is None else target.get("position"),
+                        "target_yaw": None if target is None else target.get("yaw"),
+                        "expert_trajectory_world": rpf_result.get("expert_trajectory_world"),
+                        "expert_trajectory_local": rpf_result.get("expert_trajectory_local"),
+                        "expert_action": rpf_result.get("cmd_vel"),
+                        "labels": rpf_result.get("labels"),
+                        "debug": rpf_result.get("debug"),
+                    }
+                )
+            self.capture_records.append(record)
+            self.capture_meta_file.write(json.dumps(record) + "\n")
+            self.capture_meta_file.flush()
+
+        if self.capture_frame % 20 == 0:
+            logger.info(
+                "Captured frame %d/%d", self.capture_frame + 1, len(self.capture_samples)
+            )
+        if self.rpf_expert_enabled:
+            self._advance_rpf_robot_after_capture()
+        self.capture_frame += 1
+        if self.capture_frame >= len(self.capture_samples):
+            self._finish_capture()
+
+    def _finish_capture(self) -> None:
+        if self.capture_done:
+            return
+        self.capture_done = True
+        if self.capture_meta_file is not None:
+            self.capture_meta_file.close()
+            self.capture_meta_file = None
+        try:
+            with open(os.path.join(self.capture_out, "poses.json"), "w", encoding="utf-8") as f:
+                json.dump(self.capture_records, f, indent=2)
+                f.write("\n")
+        except Exception as exc:
+            logger.warning("Failed to write pretty capture JSON: %s", exc)
+        if self.rpf_expert_enabled:
+            self._write_rpf_episode_plot()
+        logger.info("Capture complete: %s", self.capture_out)
+        self.exit_event(Application.ExitEvent)
+
+    def _write_rpf_episode_plot(self) -> None:
+        """Write a top-down plot of robot, target, pedestrians, and expert paths."""
+        if not self.capture_records:
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            logger.warning("Failed to import matplotlib for RPF plot: %s", exc)
+            return
+
+        def positions_from_records(key: str) -> np.ndarray:
+            points = []
+            for record in self.capture_records:
+                value = record.get(key)
+                if value is not None:
+                    points.append([float(value[0]), float(value[2])])
+            return np.asarray(points, dtype=np.float32)
+
+        robot_points = positions_from_records("robot_position")
+        target_points = positions_from_records("target_position")
+        if robot_points.size == 0 or target_points.size == 0:
+            return
+
+        times = np.asarray(
+            [float(record.get("time", idx)) for idx, record in enumerate(self.capture_records)],
+            dtype=np.float32,
+        )
+        target_id = self.capture_records[0].get("target_id") or self.rpf_target
+        pedestrian_tracks: dict[str, list[list[float]]] = {}
+        for record in self.capture_records:
+            for avatar in record.get("avatars", []) or []:
+                name = str(avatar.get("name", "avatar"))
+                if name == target_id:
+                    continue
+                pos = avatar.get("position")
+                if pos is None:
+                    continue
+                pedestrian_tracks.setdefault(name, []).append([float(pos[0]), float(pos[2])])
+
+        plot_path = os.path.join(self.capture_out, "episode_paths.png")
+        map_plot_path = os.path.join(self.capture_out, "episode_map_paths.png")
+        fig, ax = plt.subplots(figsize=(9, 7), dpi=160)
+
+        navmesh_drawn = False
+        try:
+            pathfinder = self.sim.pathfinder if self.sim is not None else None
+            if pathfinder is not None and pathfinder.is_loaded:
+                tris = np.asarray(pathfinder.build_navmesh_vertices(-1), dtype=np.float32)
+                if tris.size > 0 and tris.shape[0] % 3 == 0:
+                    tris = tris.reshape(-1, 3, 3)
+                    for tri in tris:
+                        poly = plt.Polygon(
+                            tri[:, [0, 2]],
+                            closed=True,
+                            facecolor="#d9d9d9",
+                            edgecolor="#b6b6b6",
+                            linewidth=0.25,
+                            alpha=0.55,
+                            zorder=0,
+                        )
+                        ax.add_patch(poly)
+                    navmesh_drawn = True
+        except Exception as exc:
+            logger.warning("Failed to draw NavMesh background in RPF plot: %s", exc)
+
+        robot_scatter = ax.scatter(
+            robot_points[:, 0],
+            robot_points[:, 1],
+            c=times[: robot_points.shape[0]],
+            cmap="viridis",
+            s=20,
+            zorder=5,
+            label="robot/scout",
+        )
+        ax.plot(robot_points[:, 0], robot_points[:, 1], color="#111111", linewidth=1.2, alpha=0.45)
+
+        ax.scatter(
+            target_points[:, 0],
+            target_points[:, 1],
+            c=times[: target_points.shape[0]],
+            cmap="Blues",
+            s=18,
+            zorder=4,
+            label=f"target: {target_id}",
+        )
+        ax.plot(target_points[:, 0], target_points[:, 1], color="#1f77b4", linewidth=1.8, alpha=0.65)
+
+        pedestrian_colors = ["#d62728", "#ff7f0e", "#9467bd", "#8c564b"]
+        for idx, (name, points_list) in enumerate(sorted(pedestrian_tracks.items())):
+            points = np.asarray(points_list, dtype=np.float32)
+            if points.size == 0:
+                continue
+            color = pedestrian_colors[idx % len(pedestrian_colors)]
+            ax.plot(points[:, 0], points[:, 1], color=color, linewidth=1.8, alpha=0.75, label=f"pedestrian: {name}")
+            ax.scatter(points[:, 0], points[:, 1], color=color, s=12, alpha=0.55, zorder=3)
+
+        snapshot_step = max(1, len(self.capture_records) // 8)
+        for idx in range(0, len(self.capture_records), snapshot_step):
+            record = self.capture_records[idx]
+            t = float(record.get("time", idx))
+            if idx < robot_points.shape[0] and idx < target_points.shape[0]:
+                ax.plot(
+                    [robot_points[idx, 0], target_points[idx, 0]],
+                    [robot_points[idx, 1], target_points[idx, 1]],
+                    color="#777777",
+                    alpha=0.25,
+                    linewidth=0.8,
+                )
+                ax.text(robot_points[idx, 0], robot_points[idx, 1] + 0.12, f"R {t:.1f}s", fontsize=7, color="#222222", ha="center")
+                ax.text(target_points[idx, 0], target_points[idx, 1] - 0.16, f"T {t:.1f}s", fontsize=7, color="#1f77b4", ha="center")
+
+            for avatar in record.get("avatars", []) or []:
+                name = str(avatar.get("name", "avatar"))
+                if name == target_id:
+                    continue
+                pos = avatar.get("position")
+                if pos is not None:
+                    ax.text(float(pos[0]), float(pos[2]) + 0.16, f"P {t:.1f}s", fontsize=7, color="#d62728", ha="center")
+
+            expert_traj = record.get("expert_trajectory_world")
+            if expert_traj:
+                traj = np.asarray([[float(p[0]), float(p[1])] for p in expert_traj], dtype=np.float32)
+                if traj.ndim == 2 and traj.shape[0] >= 2:
+                    ax.plot(traj[:, 0], traj[:, 1], color="#2ca02c", alpha=0.28, linewidth=1.1)
+
+        ax.scatter(robot_points[0, 0], robot_points[0, 1], color="#111111", marker="o", s=46, zorder=6)
+        ax.scatter(robot_points[-1, 0], robot_points[-1, 1], color="#111111", marker="x", s=58, zorder=6)
+        map_label = "NavMesh map" if navmesh_drawn else "coordinate map"
+        ax.set_title(f"RPF episode paths on {map_label}")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("z (m)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.invert_xaxis()
+        ax.grid(True, color="#eeeeee", linewidth=0.8)
+        ax.legend(loc="best", fontsize=8)
+        cbar = fig.colorbar(robot_scatter, ax=ax, pad=0.02, fraction=0.04)
+        cbar.set_label("time (s)")
+        fig.tight_layout()
+        try:
+            fig.savefig(plot_path)
+            logger.info("RPF episode path plot: %s", plot_path)
+            fig.savefig(map_plot_path)
+            logger.info("RPF episode map path plot: %s", map_plot_path)
+        except Exception as exc:
+            logger.warning("Failed to write RPF path plot: %s", exc)
+        finally:
+            plt.close(fig)
 
     def _step_size(self) -> float:
         """Return a positive step size for manual scrubbing."""
@@ -529,12 +1687,27 @@ class GaussianViewer(Application):
                 self._refresh_gaussian_avatars()
 
             if self.sim is not None:
-                self.current_time = float(self.sim.gaussian_time)
+                if self.capture_enabled:
+                    self._update_capture_frame()
+                else:
+                    self.current_time = float(self.sim.gaussian_time)
+                    self._update_object_trajectories()
+                    self._update_robot_keyboard_control(step_dt)
+                    self._update_robot_camera()
 
             if self.render_mode == RenderMode.RGB:
-                self.color_sensor_wrapper.draw_observation()
-                self.debug_draw()
-                self.render_camera.render_target.blit_rgba_to_default()
+                if self.mesh_human_overlay is not None:
+                    obs = self._render_mesh_human_overlay_observation()
+                    if obs is not None and obs.get("color_sensor") is not None:
+                        self.visualize_rgb_observation(obs["color_sensor"])
+                    else:
+                        self.color_sensor_wrapper.draw_observation()
+                        self.debug_draw()
+                        self.render_camera.render_target.blit_rgba_to_default()
+                else:
+                    self.color_sensor_wrapper.draw_observation()
+                    self.debug_draw()
+                    self.render_camera.render_target.blit_rgba_to_default()
             else:
                 self.depth_sensor_wrapper.draw_observation()
                 depth_obs = self.depth_sensor_wrapper.get_observation()
@@ -542,6 +1715,9 @@ class GaussianViewer(Application):
                     self.visualize_depth(depth_obs)
                 else:
                     logger.warning("No depth observation available")
+
+            if self.capture_enabled:
+                self._save_capture_frame()
 
         except Exception as e:
             logger.error(f"Rendering error: {e}")
@@ -805,6 +1981,74 @@ class GaussianViewer(Application):
             self.depth_shader.draw(self.depth_mesh)
         finally:
             mn.gl.Renderer.enable(mn.gl.Renderer.Feature.DEPTH_TEST)
+
+    def _render_mesh_human_overlay_observation(self) -> Optional[Dict[str, Any]]:
+        """Render color/depth observations and apply mesh human overlay for live preview."""
+        if self.sim is None or self.mesh_human_overlay is None:
+            return None
+        try:
+            obs = self.sim.get_sensor_observations()
+            self.mesh_human_overlay.apply(
+                self.sim,
+                obs,
+                [self.color_sensor_wrapper, self.depth_sensor_wrapper],
+            )
+            return obs
+        except Exception as exc:
+            logger.warning("MeshHuman live overlay failed: %s", exc)
+            return None
+
+    def visualize_rgb_observation(self, rgb_data: np.ndarray) -> None:
+        """Display a uint8 RGB/RGBA observation as a fullscreen texture."""
+        rgb = self._rgb_observation_to_uint8(rgb_data)
+        height, width = rgb.shape[:2]
+        alpha = np.full((height, width, 1), 255, dtype=np.uint8)
+        rgba = np.concatenate([rgb, alpha], axis=2)
+        rgba_flipped = np.ascontiguousarray(np.flip(rgba, axis=0), dtype=np.uint8)
+
+        if self.rgb_overlay_texture is None:
+            self.rgb_overlay_texture = mn.gl.Texture2D()
+            self.rgb_overlay_texture.magnification_filter = mn.gl.SamplerFilter.LINEAR
+            self.rgb_overlay_texture.minification_filter = mn.gl.SamplerFilter.LINEAR
+            self.rgb_overlay_texture.wrapping = (
+                mn.gl.SamplerWrapping.CLAMP_TO_EDGE
+            )
+
+        self.rgb_overlay_texture.set_storage(
+            1,
+            mn.gl.TextureFormat.RGBA8,
+            mn.Vector2i(width, height),
+        )
+        self.rgb_overlay_texture.set_sub_image(
+            0,
+            mn.Vector2i(0, 0),
+            mn.ImageView2D(
+                mn.PixelFormat.RGBA8_UNORM,
+                mn.Vector2i(width, height),
+                rgba_flipped,
+            ),
+        )
+
+        if self.depth_mesh is None:
+            self.create_fullscreen_quad()
+        if self.rgb_overlay_shader is None:
+            self.rgb_overlay_shader = mn.shaders.FlatGL2D(
+                flags=mn.shaders.FlatGL2D.Flags.TEXTURED
+            )
+
+        mn.gl.default_framebuffer.clear(
+            mn.gl.FramebufferClear.COLOR | mn.gl.FramebufferClear.DEPTH
+        )
+        mn.gl.Renderer.disable(mn.gl.Renderer.Feature.DEPTH_TEST)
+        try:
+            self.rgb_overlay_shader.bind_texture(self.rgb_overlay_texture)
+            self.rgb_overlay_shader.transformation_projection_matrix = (
+                mn.Matrix3.projection(mn.Vector2(self.framebuffer_size))
+            )
+            self.rgb_overlay_shader.color = mn.Color4(1.0, 1.0, 1.0, 1.0)
+            self.rgb_overlay_shader.draw(self.depth_mesh)
+        finally:
+            mn.gl.Renderer.enable(mn.gl.Renderer.Feature.DEPTH_TEST)
     
     def create_fullscreen_quad(self) -> None:
         """Create a fullscreen quad mesh for displaying the depth texture."""
@@ -884,6 +2128,7 @@ class GaussianViewer(Application):
             try:
                 self.sim.gaussian_time = float(new_time)
                 self._refresh_gaussian_avatars()
+                self._update_object_trajectories()
             except Exception:
                 # Older builds without Gaussian time support will silently ignore.
                 pass
@@ -891,6 +2136,8 @@ class GaussianViewer(Application):
     def move_and_look(self, repetitions: int) -> None:
         """Process movement and looking actions."""
         if repetitions == 0:
+            return
+        if self.robot_camera_enabled:
             return
 
         agent = self.sim.agents[self.agent_id]
@@ -957,10 +2204,23 @@ class GaussianViewer(Application):
         shift_pressed = bool(event.modifiers & mod.SHIFT)
         alt_pressed = bool(event.modifiers & mod.ALT)
 
+        if key in self.robot_pressed:
+            self.robot_pressed[key] = True
+            event.accepted = True
+            self.redraw()
+            return
+
         if key == pressed.ESC:
             event.accepted = True
             self.exit_event(Application.ExitEvent)
             return
+        elif hasattr(pressed, "B") and key == pressed.B:
+            self.robot_camera_enabled = not self.robot_camera_enabled
+            self._update_robot_camera()
+            logger.info(
+                "Scout front camera: %s",
+                "ON" if self.robot_camera_enabled else "OFF",
+            )
         elif key == pressed.H:
             self.print_help_text()
         elif key == pressed.J:
@@ -1114,6 +2374,9 @@ class GaussianViewer(Application):
     def key_release_event(self, event: Application.KeyEvent) -> None:
         """Handle key release events."""
         key = event.key
+
+        if key in self.robot_pressed:
+            self.robot_pressed[key] = False
 
         if key in self.pressed:
             self.pressed[key] = False
@@ -1338,6 +2601,7 @@ Colormap: Spectral_r (Red=Near, Blue=Far)"""
         if not self.sim.config.sim_cfg.enable_physics:
             physics_state = "OFF"
         mouse_mode = self.mouse_interaction.name
+        scout_cam_state = "ON" if self.robot_camera_enabled else "OFF"
 
         self.window_text.clear()
         self.window_text.render(
@@ -1351,6 +2615,7 @@ Scene: {scene_label}
 {time_info}
 Physics: {physics_state} | Mouse: {mouse_mode}
 Camera Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]{mode_info}
+Robot: R/F drive | Q/E turn | B ScoutCam {scout_cam_state}
 TAB: mode | M: mouse mode | H: help | ESC: exit
             """,
         )
@@ -1392,6 +2657,9 @@ Controls:
   WASD:       Move forward/backward/left/right
   ZX:         Move up/down
   Arrow Keys: Turn left/right, look up/down
+  R/F:        Drive scout robot forward/backward
+  Q/E:        Turn scout robot left/right
+  B:          Toggle scout front camera view
   M:          Toggle mouse mode (LOOK / GRAB)
   O:          Toggle GaussianAvatar proxy capsule overlay
   SPACE:      Toggle Gaussian playback
@@ -1595,6 +2863,24 @@ def main() -> int:
         action="store_true",
         help="Enable physics and NavMesh (requires dataset+scene mode for stage)",
     )
+    parser.add_argument("--capture", action="store_true", help="Capture scout front-camera frames and exit.")
+    parser.add_argument("--capture-out", default="outputs/scout_capture", help="Capture output directory.")
+    parser.add_argument(
+        "--capture-route",
+        default=None,
+        help="Scout route as x,y,z:x,y,z[:x,y,z...].",
+    )
+    parser.add_argument("--capture-fps", type=float, default=10.0)
+    parser.add_argument("--capture-speed", type=float, default=0.6)
+    parser.add_argument("--capture-max-frames", type=int, default=None)
+    parser.add_argument("--capture-depth", action="store_true", help="Also save depth .npy frames.")
+    parser.add_argument(
+        "--rpf-expert",
+        action="store_true",
+        help="In capture mode, control scout online with the RPF expert instead of a fixed route.",
+    )
+    parser.add_argument("--rpf-target", default="avatar1_actor", help="Target avatar name or index.")
+    parser.add_argument("--rpf-preferred-side", type=int, default=1, choices=[-1, 1])
 
     args = parser.parse_args()
 
@@ -1640,6 +2926,16 @@ def main() -> int:
         time_rate=args.time_rate,
         autoplay=args.playback,
         enable_physics=bool(args.enable_physics),
+        capture=bool(args.capture),
+        capture_out=args.capture_out,
+        capture_route=args.capture_route,
+        capture_fps=args.capture_fps,
+        capture_speed=args.capture_speed,
+        capture_max_frames=args.capture_max_frames,
+        capture_depth=bool(args.capture_depth),
+        rpf_expert=bool(args.rpf_expert),
+        rpf_target=args.rpf_target,
+        rpf_preferred_side=args.rpf_preferred_side,
     )
     if viewer.sim is None:
         return 1

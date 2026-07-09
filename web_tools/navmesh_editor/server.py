@@ -69,6 +69,13 @@ def list_scenes():
     group whose subdirs are scenes (e.g. train/<scene>, val/<scene>); both are
     scanned, so subdirs without any *.gs.ply (assets/, avatars/, ...) drop out."""
     out, seen = [], set()
+    for ply in sorted(glob.glob(os.path.join(GS_DIR, "*.gs.ply"))):
+        if ply in seen:
+            continue
+        seen.add(ply)
+        _, name, group = scene_dir_and_split(ply)
+        nav = os.path.join(os.path.dirname(ply), name + ".navmesh")
+        out.append({"name": name, "split": group, "has_navmesh": os.path.exists(nav)})
     for sub in sorted(glob.glob(os.path.join(GS_DIR, "*", ""))):
         plys = (sorted(glob.glob(os.path.join(sub, "*.gs.ply")))          # sub IS a scene
                 or sorted(glob.glob(os.path.join(sub, "*", "*.gs.ply"))))  # sub groups scenes
@@ -94,6 +101,9 @@ def resolve_ply(scene):
             hits = sorted(glob.glob(os.path.join(cand, "*.gs.ply")))
             if hits:
                 return hits[0]
+    hits = sorted(glob.glob(os.path.join(GS_DIR, f"{scene}.gs.ply")))
+    if hits:
+        return hits[0]
     # a bare scene name: search one group level under GS_DIR (e.g. <group>/<scene>)
     hits = sorted(glob.glob(os.path.join(GS_DIR, "*", scene, "*.gs.ply")))
     if hits:
@@ -103,8 +113,14 @@ def resolve_ply(scene):
 
 def scene_dir_and_split(ply_path):
     d = os.path.dirname(ply_path)
-    name = os.path.basename(d)
-    group = os.path.basename(os.path.dirname(d))   # parent folder name, e.g. train / val
+    ply_name = os.path.basename(ply_path)
+    ply_stem = ply_name[:-len(".gs.ply")] if ply_name.endswith(".gs.ply") else os.path.splitext(ply_name)[0]
+    if os.path.abspath(d) == os.path.abspath(GS_DIR):
+        name = ply_stem
+        group = os.path.basename(d)
+    else:
+        name = os.path.basename(d)
+        group = os.path.basename(os.path.dirname(d))   # parent folder name, e.g. train / val
     return d, name, group
 
 
