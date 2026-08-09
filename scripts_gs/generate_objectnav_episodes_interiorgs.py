@@ -14,7 +14,12 @@ Pipeline per scene:
   3. transform boxes native (Right,Back,Up) -> habitat (Y-up): (x,y,z)->(x, z, -y)
   4. map InteriorGS fine labels -> the 12 ObjectNav indoor categories
   5. per object: sample navigable view_points near it on the navmesh, facing it
-  6. reuse the SAME episode sampler + output schema as the original generator
+  6. drop objects that sit below the local floor, float entirely above reach
+     (MAX_GOAL_BOTTOM_ABOVE_FLOOR), or are too small to identify (MIN_GOAL_MAX_DIM)
+  7. reuse the SAME episode sampler + output schema as the original generator
+
+Each emitted goal carries `src_label` (the raw InteriorGS label) and
+`semantic_ins_id` so the many-to-one label collapse stays auditable downstream.
 
 Output schema is byte-for-byte structurally identical to the original
 objectnav/<split>/content/<scene>.json.gz files.
@@ -47,6 +52,8 @@ VP_EXTRA_RADIUS = 2.0       # sample up to footprint_radius + this (m)
 VP_MAX_PER_OBJECT = 25
 VP_SAMPLE_ATTEMPTS = 120
 MIN_VIEWPOINTS_PER_OBJECT = 1   # object must have >=1 reachable stance to be a goal
+MAX_GOAL_BOTTOM_ABOVE_FLOOR = 2.0
+MIN_GOAL_MAX_DIM = 0.25
 
 # InteriorGS fine label -> ObjectNav category. Conservative, furniture-scale only.
 # Deliberately EXCLUDED: ceiling/wall lights (downlights, chandelier, ceiling lamp,
@@ -78,6 +85,7 @@ LABEL_TO_CAT = {
     # cabinet / wardrobe / nightstand
     "cabinet": "cabinet", "wardrobe": "cabinet", "storage cabinet": "cabinet",
     "display cabinet": "cabinet", "tv cabinet": "cabinet", "bedside table": "cabinet",
+    "trash_can": "trash can", "trash can": "trash can",
     # lamp (floor/table lamps only, never ceiling fixtures)
     "floor lamp": "lamp", "table lamp": "lamp",
     # potted plant
@@ -96,7 +104,8 @@ def native_to_habitat(P):
 
 
 def load_gt_objects(labels_path):
-    """Return list of (category, center_xyz_habitat, footprint_radius, box_top_y, ins_id, label)."""
+    """Return list of (category, center_xyz_habitat, footprint_radius,
+    box_bottom_y, box_top_y, box_max_dim, ins_id, label)."""
     raw = json.load(open(labels_path))
     out = []
     for o in raw:
@@ -111,8 +120,11 @@ def load_gt_objects(labels_path):
         center = H.mean(0)
         xz = H[:, [0, 2]]
         foot_r = float(np.linalg.norm(xz.max(0) - xz.min(0)) / 2.0)
+        box_bottom_y = float(H[:, 1].min())
         box_top_y = float(H[:, 1].max())
-        out.append((cat, center, foot_r, box_top_y, o.get("ins_id", ""), lab))
+        box_max_dim = float((H.max(0) - H.min(0)).max())
+        out.append((cat, center, foot_r, box_bottom_y, box_top_y, box_max_dim,
+                    o.get("ins_id", ""), lab))
     return out
 
 
@@ -187,7 +199,7 @@ def build_goals_by_category(objects_per_category, scene_basename):
     for cat, objects in objects_per_category.items():
         goals = []
         for i, obj in enumerate(objects):
-            goals.append({
+            goal = {
                 "object_id": f"{cat}_{i}",
                 "object_name": f"{cat}_{i}",
                 "object_name_id": i,
@@ -198,20 +210,52 @@ def build_goals_by_category(objects_per_category, scene_basename):
                      "iou": vp["iou"]}
                     for vp in obj["view_points"]
                 ],
-            })
+            }
+            goals.append(goal)
         goals_by_category[f"{scene_basename}_{cat}"] = goals
     return goals_by_category
+
+
+def build_provenance(objects_per_category, scene_basename):
+    """object_id -> {src_label, semantic_ins_id}, for a SIDECAR file.
+
+    This deliberately does NOT live inside the goal dicts. habitat-lab builds
+    goals with ``ObjectGoal(**serialized_goal)``, whose attrs schema is exactly
+    {position, radius, object_id, object_name, object_name_id, object_category,
+    room_id, room_name, view_points} — any extra key raises TypeError and the
+    whole dataset fails to load. Provenance still matters (`object_category` is a
+    many-to-one collapse of the InteriorGS label, so without src_label there is
+    no way to tell what a goal actually is), so it is written alongside instead.
+    """
+    prov = {}
+    for cat, objects in objects_per_category.items():
+        for i, obj in enumerate(objects):
+            entry = {}
+            if obj.get("src_label") is not None:
+                entry["src_label"] = obj["src_label"]
+            if obj.get("ins_id") not in (None, ""):
+                entry["semantic_ins_id"] = str(obj["ins_id"])
+            if entry:
+                entry["object_category"] = cat
+                prov[f"{cat}_{i}"] = entry
+    return {"scene": scene_basename, "goals": prov}
 
 
 def generate_episodes(pf, scene_id, goals_by_category, num_episodes, seed):
     np.random.seed(seed)
     pf.seed(seed)
     scene_basename = os.path.basename(scene_id)
+    # Categories come from the goal set itself, NOT from UNIFIED_CATEGORY_TO_ID.
+    # Iterating the 22-class map silently skips every goal whose category is not
+    # one of those 22 — so on a fine-grained relabeled goal set (armchair, teatable,
+    # shelf, ...) it would return almost no episodes with no error. Sorted so the
+    # category order, and therefore the RNG stream, is deterministic.
+    prefix = f"{scene_basename}_"
     cat_viewpoints = {}
-    for cat in UNIFIED_CATEGORY_TO_ID:
-        key = f"{scene_basename}_{cat}"
-        if key not in goals_by_category:
+    for key in sorted(goals_by_category):
+        if not key.startswith(prefix):
             continue
+        cat = key[len(prefix):]
         vps = [np.array(vp["agent_state"]["position"])
                for goal in goals_by_category[key] for vp in goal["view_points"]]
         if vps:
@@ -261,17 +305,20 @@ def _atomic_write_gz_json(data, path):
     os.replace(tmp, path)
 
 
-def save_dataset(episodes, goals_by_category, path):
+def save_dataset(episodes, goals_by_category, path, category_map=None):
+    m = UNIFIED_CATEGORY_TO_ID if category_map is None else category_map
     _atomic_write_gz_json({
-        "category_to_task_category_id": UNIFIED_CATEGORY_TO_ID,
-        "category_to_scene_annotation_category_id": UNIFIED_CATEGORY_TO_ID,
+        "category_to_task_category_id": m,
+        "category_to_scene_annotation_category_id": m,
         "goals_by_category": goals_by_category,
         "episodes": episodes,
     }, path)
 
 
 # ------------------------------------------------------------------ per-scene driver
-def process_scene(scene, split, scenes_root, labels_dir, out_root, seed):
+def process_scene(scene, split, scenes_root, labels_dir, out_root, seed,
+                  max_goal_bottom=MAX_GOAL_BOTTOM_ABOVE_FLOOR,
+                  min_goal_size=MIN_GOAL_MAX_DIM):
     import habitat_sim
     igs_id = scene[len("interior_"):]
     navmesh = os.path.join(scenes_root, split, scene, f"{scene}.navmesh")
@@ -288,9 +335,14 @@ def process_scene(scene, split, scenes_root, labels_dir, out_root, seed):
 
     gt = load_gt_objects(labels)
     objects_per_category = {}
-    n_obj, n_kept, n_subfloor = 0, 0, 0
-    for cat, center, foot_r, box_top_y, ins_id, lab in gt:
+    n_obj, n_kept, n_subfloor, n_toohigh, n_toosmall = 0, 0, 0, 0, 0
+    for cat, center, foot_r, box_bottom_y, box_top_y, box_max_dim, ins_id, lab in gt:
         n_obj += 1
+        # too small to be visually identifiable from a stance — check before the
+        # expensive view_point sampling
+        if box_max_dim < min_goal_size:
+            n_toosmall += 1
+            continue
         vps = sample_view_points(pf, center, foot_r, floor_y)
         if len(vps) < MIN_VIEWPOINTS_PER_OBJECT:
             continue
@@ -300,6 +352,11 @@ def process_scene(scene, split, scenes_root, labels_dir, out_root, seed):
         local_floor = float(np.median([vp["position"][1] for vp in vps]))
         if box_top_y < local_floor - 0.1:
             n_subfloor += 1
+            continue
+        # ...and the mirror case: objects whose whole box floats above reach
+        # (ceiling fixtures, hanging planters, high wall-mounted units).
+        if box_bottom_y > local_floor + max_goal_bottom:
+            n_toohigh += 1
             continue
         n_kept += 1
         objects_per_category.setdefault(cat, []).append({
@@ -312,11 +369,17 @@ def process_scene(scene, split, scenes_root, labels_dir, out_root, seed):
     eps = generate_episodes(pf, scene_id, gbc, n_ep, seed)
     out = os.path.join(out_root, split, "content", f"{scene}.json.gz")
     save_dataset(eps, gbc, out)
+    prov_path = os.path.join(out_root, split, "provenance", f"{scene}.json")
+    os.makedirs(os.path.dirname(prov_path), exist_ok=True)
+    with open(prov_path, "w") as fh:
+        json.dump(build_provenance(objects_per_category, f"{scene}.gs.ply"), fh, indent=1)
     cats = {c: len(v) for c, v in objects_per_category.items()}
     print(f"  {scene} [{split}]: GT-objs(mapped)={n_obj} kept={n_kept} "
-          f"(subfloor-dropped={n_subfloor}) cats={cats} episodes={len(eps)}")
+          f"(subfloor-dropped={n_subfloor} toohigh-dropped={n_toohigh} "
+          f"toosmall-dropped={n_toosmall}) cats={cats} episodes={len(eps)}")
     return {"scene": scene, "split": split, "n_mapped": n_obj, "n_kept": n_kept,
-            "n_subfloor": n_subfloor, "cats": cats, "n_episodes": len(eps)}
+            "n_subfloor": n_subfloor, "n_toohigh": n_toohigh, "n_toosmall": n_toosmall,
+            "cats": cats, "n_episodes": len(eps)}
 
 
 def main():
@@ -326,6 +389,13 @@ def main():
     ap.add_argument("--out-root", default="data/scene_datasets/gs_scenes/episodes/objectnav_interiorgs_gt")
     ap.add_argument("--scene", default=None, help="only this scene")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--max-goal-bottom", type=float, default=MAX_GOAL_BOTTOM_ABOVE_FLOOR,
+                    help="drop goals whose bounding box sits entirely more than this many "
+                         "metres above the local navigable floor (default: %(default)s). "
+                         "Use a large value to disable.")
+    ap.add_argument("--min-goal-size", type=float, default=MIN_GOAL_MAX_DIM,
+                    help="drop goals whose largest bounding-box dimension is below this "
+                         "many metres (default: %(default)s). Use 0 to disable.")
     args = ap.parse_args()
 
     # discover interior scenes + split from the existing episode tree
@@ -341,7 +411,8 @@ def main():
     summary = []
     for i, (scn, split) in enumerate(interior):
         print(f"[{i+1}/{len(interior)}] {scn}")
-        r = process_scene(scn, split, args.scenes_root, args.labels_dir, args.out_root, args.seed)
+        r = process_scene(scn, split, args.scenes_root, args.labels_dir, args.out_root,
+                          args.seed, args.max_goal_bottom, args.min_goal_size)
         if r:
             summary.append(r)
 

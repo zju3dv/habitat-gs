@@ -11,8 +11,6 @@ import sys
 import numpy as np
 import torch
 
-os.chdir("/mnt/data/home/ziyuan/habitat-gs-environment/habitat-gs")
-
 from habitat.config.default_structured_configs import HabitatConfigPlugin, register_hydra_plugin
 from habitat_baselines.config.default_structured_configs import HabitatBaselinesConfigPlugin
 
@@ -24,11 +22,32 @@ from omegaconf import OmegaConf
 
 from habitat.config.default import patch_config
 
+
+def repo_root() -> str:
+    """habitat-gs repo root (this file lives in ``<root>/scripts_gs``).
+
+    Set ``HABITAT_GS_ROOT`` to override, e.g. when the scripts are run from a
+    relocated copy that is not next to ``data/``.
+    """
+    root = os.environ.get("HABITAT_GS_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    return os.path.abspath(os.path.expanduser(root))
+
+
+ROOT = repo_root()
+CONFIG_DIR = os.path.join(ROOT, "data", "scene_datasets", "gs_scenes", "configs")
+
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/dyn_track_bc"
+# Resolved against the repo root, matching the documented invocation
+# ``python scripts_gs/train_dynamic_nav_dagger.py output/dyn_track_dagger 90000``
+# (README.md:1005), which is run from the repo root.
+OUT = OUT if os.path.isabs(OUT) else os.path.join(ROOT, OUT)
 TOTAL_STEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 60000
 N_ENVS = 2
 SEG_T = 64
 LR = 2.5e-4
+TEACHER_FORCING_STEPS = 15000   # after this many env steps, switch to student-driven collection
 
 
 def oracle_action_idx(obs) -> int:
@@ -48,9 +67,19 @@ def oracle_action_idx(obs) -> int:
 
 
 def main() -> None:
-    with initialize_config_dir(
-        config_dir=os.path.abspath("data/scene_datasets/gs_scenes/configs"), version_base=None
-    ):
+    if not os.path.isdir(CONFIG_DIR):
+        raise SystemExit(
+            f"GS config dir not found: {CONFIG_DIR}\n"
+            "Run this from a habitat-gs checkout with the GS scene dataset in place, "
+            "or point HABITAT_GS_ROOT at one."
+        )
+    # The task configs reference `data/scene_datasets/...` relatively, and habitat
+    # resolves those against the process cwd when the envs are constructed below.
+    # Done here rather than at import time so that importing this module (e.g. to
+    # reuse oracle_action_idx) does not silently move the caller's cwd.
+    os.chdir(ROOT)
+
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
         cfg = compose(config_name="ddppo_dynamic_track_gs_train")
     cfg = patch_config(cfg)
     OmegaConf.set_readonly(cfg, None)
@@ -116,7 +145,7 @@ def main() -> None:
             seg_count += N_ENVS
 
         # DAgger: teacher-forced warmup, then student-driven collection (oracle labels)
-        if steps_done < 15000:
+        if steps_done < TEACHER_FORCING_STEPS:
             exec_actions = labels.view(-1).tolist()
         else:
             with torch.no_grad():
