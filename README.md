@@ -167,10 +167,6 @@ For a static GS scene without avatars, you only need:
 
 **IMPORTANT**: Habitat-GS recognizes GS stage assets by suffix. This means your scene file MUST end with `.gs.ply` or `.3dgs.ply`.
 
-**NOTE**: In our [provided dataset](https://huggingface.co/datasets/RukawaY/gs_scenes), an outdoor scene may also have:
-
-- a background 3DGS asset (`background.ply`) for far-field content like sky or distant geometry that was separated from the foreground during reconstruction. To render foreground and background together as a single stage, merge the two `.ply` files into one with `tools_gs/merge_background_gs.py`.
-
 For NavMesh generation, use our interactive [interactive web tool](https://github.com/zju3dv/habitat-gs/blob/main/web_tools/README.md#navmesh_editor): it renders the GS scene in your browser and lets you draw/modify the walkable area, then bakes a Habitat `.navmesh` for simulation.
 
 ```bash
@@ -447,8 +443,7 @@ data/scene_datasets/gs_scenes/
 ├── val.scene_dataset_config.json
 ├── train/                           # 110 training scenes
 │   ├── scene01/                     #   self-reconstructed (55 scenes): full assets
-│   │   ├── scene01.gs.ply           #     foreground GS render asset
-│   │   ├── background.ply           #     background GS asset (sky / distant geometry; optional)
+│   │   ├── scene01.gs.ply           #     GS render asset
 │   │   ├── scene01.mesh.ply         #     collision mesh (will not be used unless physics is enabled)
 │   │   └── scene01.navmesh          #     navigation mesh
 │   ├── scene02/ ... scene55/

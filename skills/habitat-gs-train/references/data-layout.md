@@ -6,7 +6,7 @@ Everything hangs off a single shared root: **`data/scene_datasets/gs_scenes/`**.
 data/scene_datasets/gs_scenes/
 ├── train.scene_dataset_config.json   # registers train .gs.ply stages + per-scene navmesh
 ├── val.scene_dataset_config.json     # same for val
-├── train/<scene>/<scene>.gs.ply (+ .navmesh, optional .mesh.ply / background.ply)
+├── train/<scene>/<scene>.gs.ply (+ .navmesh, optional .mesh.ply)
 ├── val/<scene>/...
 ├── configs/                          # Hydra task configs (ddppo_*_gs_{train,eval}.yaml, vln_*.yaml)
 ├── episodes/                         # nav episode datasets (.json.gz)  ← generators write here
