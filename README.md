@@ -1032,13 +1032,12 @@ See [docs/habitatagent.md](docs/habitatagent.md#agent-skill) for more details.
 If you find Habitat-GS useful in your research, please consider citing:
 
 ```bibtex
-@misc{xia2026habitatgs,
-    title={Habitat-GS: A High-Fidelity Navigation Simulator with Dynamic Gaussian Splatting}, 
-    author={Ziyuan Xia and Jingyi Xu and Chong Cui and Yuanhong Yu and Jiazhao Zhang and Qingsong Yan and Tao Ni and Junbo Chen and Xiaowei Zhou and Hujun Bao and Ruizhen Hu and Sida Peng},
-    year={2026},
-    eprint={2604.12626},
-    archivePrefix={arXiv},
-    primaryClass={cs.RO},
-    url={https://arxiv.org/abs/2604.12626}, 
+@inproceedings{xia2026habitat,
+  title={Habitat-gs: A high-fidelity navigation simulator with dynamic gaussian splatting},
+  author={Xia, Ziyuan and Xu, Jingyi and Cui, Chong and Yu, Yuanhong and Zhang, Jiazhao and Yan, Qingsong and Ni, Tao and Chen, Junbo and Zhou, Xiaowei and Bao, Hujun and others},
+  booktitle={European Conference on Computer Vision},
+  pages={306--323},
+  year={2026},
+  organization={Springer}
 }
 ```
