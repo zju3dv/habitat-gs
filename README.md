@@ -15,6 +15,7 @@
   <a href="https://arxiv.org/abs/2604.12626"><img src='https://img.shields.io/badge/arXiv-Habitat--GS-red' alt='Paper PDF'></a>
   <a href='https://zju3dv.github.io/habitat-gs/'><img src='https://img.shields.io/badge/Project_Page-Habitat--GS-orange' alt='Project Page'></a>
   <a href="https://huggingface.co/datasets/RukawaY/gs_scenes"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-GS_Dataset-blue' alt='Hugging Face'></a>
+  <a href="https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-HabitatGS_Benchmark-blue' alt='HabitatGS-Benchmark on Hugging Face'></a>
   <a href="docs/gs_assets/wechat.png">
     <img src="https://img.shields.io/badge/WeChat-Group-green?logo=wechat&logoColor=green">
   </a>
@@ -43,6 +44,8 @@
 
 
 ## 📢 News
+
+> **[2026-10]** 🎉 We release **ObjectNav and Multi-ObjectNav test trajectories** in [HabitatGS-Benchmark](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark)! Each task includes **150 test episodes** with ground-truth reference trajectories and evaluation tools. See the [benchmark guide](docs/benchmark/README.md) to get started.
 
 > **[2026-06]** 🎉 Habitat-GS is accepted to ECCV 2026! See you in Malmö!
 
@@ -73,6 +76,7 @@ Compared with traditional mesh-based simulators, Habitat-GS can achieve photo-re
   - 📦 [Install Habitat-GS](#-install-habitat-gs)
   - 🤖 [Install Habitat-Lab](#-install-habitat-lab-optional-but-recommended)
 - 📦 [Download GS Asset](#-download-gs-asset)
+- 🧪 [ObjectNav / Multi-ObjectNav Benchmark](docs/benchmark/README.md)
 - 🚀 [Run Habitat-GS](#-run-habitat-gs)
   - 🧱 [Prepare GS Assets](#-prepare-gs-assets)
   - 🗂️ [Organize Scene Dataset](#%EF%B8%8F-organize-scene-dataset)
