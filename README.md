@@ -44,6 +44,8 @@
 
 ## 📢 News
 
+> **[2026-10]** [HabitatGS-Benchmark v1](https://huggingface.co/datasets/yyh929/HabitatGS-Benchmark) provides **150 ObjectNav and 150 ordered Multi-ObjectNav test episodes**, with evaluation tools and checksums. See the [benchmark guide](docs/benchmark/README.md) for task definitions and current scene-asset availability.
+
 > **[2026-06]** 🎉 Habitat-GS is accepted to ECCV 2026! See you in Malmö!
 
 > **[2026-05]** 🎉 Try our [NavMesh editing tool](https://github.com/zju3dv/habitat-gs/blob/main/web_tools/README.md#navmesh_editor)! It closes the loop from a raw 3DGS scene to navigable simulation (**3DGS → NavMesh → simulation**): draw/edit the walkable area on the 3DGS scene in your browser, bake a Habitat NavMesh, and use it for navigation in Habitat-GS.
@@ -73,6 +75,7 @@ Compared with traditional mesh-based simulators, Habitat-GS can achieve photo-re
   - 📦 [Install Habitat-GS](#-install-habitat-gs)
   - 🤖 [Install Habitat-Lab](#-install-habitat-lab-optional-but-recommended)
 - 📦 [Download GS Asset](#-download-gs-asset)
+- 🧪 [ObjectNav / Multi-ObjectNav Benchmark](docs/benchmark/README.md)
 - 🚀 [Run Habitat-GS](#-run-habitat-gs)
   - 🧱 [Prepare GS Assets](#-prepare-gs-assets)
   - 🗂️ [Organize Scene Dataset](#%EF%B8%8F-organize-scene-dataset)
