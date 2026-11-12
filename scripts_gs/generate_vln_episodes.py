@@ -620,12 +620,14 @@ def _path_description(ref: list, geo: float) -> str:
                 turn -= 360
             while turn < -180:
                 turn += 360
+            # _heading() increases counter-clockwise seen from above (+Y up),
+            # i.e. a positive heading change is habitat_sim's turn_left.
             if abs(turn) < 10:
                 td = "continue straight"
             elif turn > 0:
-                td = f"turn right {abs(turn):.0f} deg"
-            else:
                 td = f"turn left {abs(turn):.0f} deg"
+            else:
+                td = f"turn right {abs(turn):.0f} deg"
             parts.append(f"{td}, walk {seg_dist:.1f}m")
     return f"Total distance {geo:.0f}m. Segments: " + " -> ".join(parts)
 
